@@ -1,735 +1,436 @@
-use clap::Parser;
-use image::{DynamicImage, GrayImage, ImageReader, Luma};
+// ===============================
+// Cargo.toml (example)
+// ===============================
+// [package]
+// name = "zaft"
+// version = "0.3.0"
+// edition = "2021"
+//
+// [dependencies]
+// clap = { version = "4", features = ["derive"] }
+// image = "0.25"
+// anyhow = "1"
+// thiserror = "1"
+//
+// # Run:
+// #   cargo run --release -- stats atlas.png
+// #   cargo run --release -- compress atlas.png -o atlas.zaft --bg 255 --max-pal 8
+// #   cargo run --release -- decompress atlas.zaft -o roundtrip.png
+//
+// ===============================
+// src/main.rs
+// ===============================
 use std::{
     fs::File,
-    io::{BufWriter, Write},
-    path::Path,
+    io::{Read, Write},
+    path::PathBuf,
 };
 
-// OI (8bpp grayscale) — lean stream (ZRUN, LITERAL, COPY) with per-row predictors
-// -------------------------------------------------------------------------------
-// Header (big-endian):
-//   magic:  b"oi00"
-//   width:  u32
-//   height: u32
-//   cs:     u8  (0 = this stream)
-//   pad:    [u8;3] = 0
-//
-// For each row:
-//   predictor: 2 bits  (00 NONE, 01 SUB, 10 UP, 11 AVG)
-//   row bitstream (MSB-first), producing exactly `width` bytes
-//
-// Opcodes:
-//   0                        : ZRUN  — gamma(L)          (L>=1) emit L zero bytes
-//   10                       : LIT   — gamma(L) + L bytes (raw)
-//   110 dddddddd gamma(L)    : COPY  — distance=1..255 from already produced bytes in this row; L>=3
-//
+use anyhow::{Context, Result, anyhow};
+use clap::{Parser, Subcommand};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Luma};
+
+// -------------------------------
+// ZAFT v3: Global-Palette + RLE + Bitpack (MCU-simple)
+// -------------------------------
+// Header (little-endian):
+//   magic:  'Z''A''F''T' (4)
+//   version:u8 (=3)
+//   bg:     u8 (row-reset previous; only used by tools; decoder ignores)
+//   w,h:    u32, u32
+//   P:      u8  palette size in [1..16]
+//   palette: P bytes (ascending by frequency)
+// Payload: sequence of tokens over palette *indices* (not grayscale):
+//   Token header (1 byte): bits 7..6 kind, bits 5..0 reserved(0)
+//     0b00 RUN      -> [idx:u8][len:varint]          // run of index idx
+//     0b01 BITPACK  -> [len:varint][packed indices]  // raw indices bit-packed at B = ceil(log2 P)
+//     0b10 MIXRUN   -> [bg_idx:u8][len:varint]       // run of bg_idx (hint for typical background)
+//     0b11 RESERVED
 // Notes:
-//   * Only the final stream is byte-aligned; rows/opcodes are bit-packed.
-//   * COPY works within the current row residual/pixel stream (post-predictor space).
+//   * Encoder picks a global palette of up to --max-pal (default 8) most frequent gray levels.
+//   * Every pixel is mapped to nearest palette entry (by absolute difference). If P==1, whole image
+//     is a single run.
+//   * RUN is great for long spans of background/solid strokes. BITPACK covers the rest compactly
+//     at B bits per pixel (e.g., P=8 -> 3bpp). MIXRUN is identical to RUN but lets encoder elide
+//     repeating idx byte when idx==bg (we keep it explicit for simplicity in v3, see TODOs).
 
-const MAGIC: [u8; 4] = *b"oi00";
-const OI_END: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
+const MAGIC: [u8; 4] = *b"ZAFT";
+const VERSION: u8 = 3;
 
-#[derive(Parser, Debug)]
-#[command(name = "oi", version)]
-struct Args {
-    input: String,
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum Kind {
+    Run = 0b00,
+    Bitpack = 0b01,
+    MixRun = 0b10,
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let input_path = Path::new(&args.input);
-    let img = ImageReader::open(&input_path)?
-        .with_guessed_format()?
-        .decode()?;
-    let gray = to_grayscale(img);
-    let (w, h) = gray.dimensions();
+#[derive(Parser)]
+#[command(author, version, about = "zaft v3: global-palette RLE+bitpack for grayscale font atlases", long_about=None)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
 
-    let mut pixels: Vec<u8> = Vec::with_capacity((w as usize) * (h as usize));
-    for y in 0..h {
-        for x in 0..w {
-            pixels.push(gray.get_pixel(x, y)[0]);
-        }
+#[derive(Subcommand)]
+enum Cmd {
+    Compress {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 255)]
+        bg: u8,
+        #[arg(long, default_value_t = 8)]
+        max_pal: u8,
+    },
+    Decompress {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    Stats {
+        input: PathBuf,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Compress {
+            input,
+            output,
+            bg,
+            max_pal,
+        } => do_compress(input, output, bg, max_pal),
+        Cmd::Decompress { input, output } => do_decompress(input, output),
+        Cmd::Stats { input } => do_stats(input),
     }
+}
 
-    let encoded = encode_oi(&pixels, w, h);
+fn do_compress(input: PathBuf, output: PathBuf, bg: u8, max_pal: u8) -> Result<()> {
+    let img = image::open(&input).with_context(|| format!("open {:?}", input))?;
+    let gray = img.to_luma8();
+    let (w, h) = gray.dimensions();
+    let pixels = gray.into_raw();
 
-    let out_path = input_path.with_extension("oi");
-    let mut f = BufWriter::new(File::create(&out_path)?);
-    f.write_all(&encoded)?;
+    // Build global palette (top-K by frequency up to 16, limited by --max-pal)
+    let k = max_pal.clamp(1, 16) as usize;
+    let (palette, pcount) = build_palette(&pixels, k);
+    let bpp = (32 - (pcount as u32 - 1).leading_zeros()).max(1) as u8; // ceil(log2 P)
+
+    // Map pixels to indices
+    let idxs = map_to_palette(&pixels, &palette[..pcount]);
+
+    let payload = encode_v3(&idxs, w, h, palette[0]);
+
+    // header
+    let mut out = Vec::with_capacity(4 + 1 + 1 + 4 + 4 + 1 + pcount + payload.len());
+    out.extend_from_slice(&MAGIC);
+    out.push(VERSION);
+    out.push(bg);
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.push(pcount as u8);
+    out.extend_from_slice(&palette[..pcount]);
+    out.extend_from_slice(&payload);
+
+    let mut f = File::create(&output)?;
+    f.write_all(&out)?;
     f.flush()?;
+
+    let raw = (w as usize * h as usize) as f64;
+    let ratio = raw / out.len() as f64;
     eprintln!(
-        "Wrote {} ({}x{}, {} bytes)",
-        out_path.display(),
-        w,
-        h,
-        encoded.len()
+        "P={pcount} (bpp={bpp}), {w}x{h} raw {} -> {} bytes, ratio {:.2}x",
+        raw as usize,
+        out.len(),
+        ratio
     );
     Ok(())
 }
 
-fn to_grayscale(img: DynamicImage) -> GrayImage {
-    match img {
-        DynamicImage::ImageLuma8(g) => g,
-        DynamicImage::ImageLumaA8(ga) => {
-            let (w, h) = ga.dimensions();
-            let mut out = GrayImage::new(w, h);
-            for (x, y, p) in ga.enumerate_pixels() {
-                out.put_pixel(x, y, Luma([p.0[0]]));
-            }
-            out
-        }
-        _ => img.to_luma8(),
+fn do_decompress(input: PathBuf, output: PathBuf) -> Result<()> {
+    let mut data = Vec::new();
+    File::open(&input)?.read_to_end(&mut data)?;
+    if data.len() < 4 + 1 + 1 + 4 + 4 + 1 {
+        return Err(anyhow!("file too small"));
     }
+    if data[0..4] != MAGIC {
+        return Err(anyhow!("bad magic"));
+    }
+    if data[4] != VERSION {
+        return Err(anyhow!("unsupported version {}", data[4]));
+    }
+    let _bg = data[5];
+    let w = u32::from_le_bytes(data[6..10].try_into().unwrap());
+    let h = u32::from_le_bytes(data[10..14].try_into().unwrap());
+    let pcount = data[14] as usize;
+    let off = 15;
+    if off + pcount > data.len() {
+        return Err(anyhow!("bad palette"));
+    }
+    let palette = &data[off..off + pcount];
+    let payload = &data[off + pcount..];
+
+    let idxs = decode_v3(payload, w, h)?;
+    if idxs.iter().any(|&i| (i as usize) >= pcount) {
+        return Err(anyhow!("index out of range"));
+    }
+    let mut px = vec![0u8; (w * h) as usize];
+    for (i, &idx) in idxs.iter().enumerate() {
+        px[i] = palette[idx as usize];
+    }
+    let img: ImageBuffer<Luma<u8>, _> =
+        ImageBuffer::from_raw(w, h, px).ok_or_else(|| anyhow!("unexpected buffer size"))?;
+    DynamicImage::ImageLuma8(img).save(&output)?;
+    eprintln!("Decompressed -> {:?}", output);
+    Ok(())
 }
 
-// ===================== Bit I/O =====================
-struct BitWriter {
-    buf: Vec<u8>,
-    acc: u32,
-    nbits: u8,
-}
-impl BitWriter {
-    fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            acc: 0,
-            nbits: 0,
-        }
+fn do_stats(input: PathBuf) -> Result<()> {
+    let img = image::open(&input)?;
+    let gray = img.to_luma8();
+    let (w, h) = gray.dimensions();
+    let px = gray.into_raw();
+    let mut hist = [0usize; 256];
+    for &v in &px {
+        hist[v as usize] += 1;
     }
-    fn write(&mut self, bits: u32, n: u8) {
-        let mut v = bits & ((1u32 << n) - 1);
-        let mut k = n;
-        while k > 0 {
-            let space = 8 - self.nbits;
-            let take = space.min(k);
-            let shift = k - take;
-            let chunk = (v >> shift) & ((1 << take) - 1);
-            self.acc = (self.acc << take) | chunk;
-            self.nbits += take;
-            k -= take;
-            if self.nbits == 8 {
-                self.buf.push(self.acc as u8);
-                self.acc = 0;
-                self.nbits = 0;
-            }
-        }
-    }
-    fn write_bit(&mut self, b: bool) {
-        self.write(b as u32, 1);
-    }
-    fn write_u8(&mut self, b: u8) {
-        self.write(b as u32, 8);
-    }
-    fn write_gamma(&mut self, n: u32) {
-        // Elias gamma code for n>=1
-        debug_assert!(n >= 1);
-        let b = 32 - n.leading_zeros();
-        for _ in 1..b {
-            self.write(0, 1);
-        } // (b-1) zeros
-        self.write(1, 1);
-        if b > 1 {
-            self.write(n & ((1 << (b - 1)) - 1), (b - 1) as u8);
-        }
-    }
-    fn byte_align(&mut self) {
-        if self.nbits != 0 {
-            self.write(0, 8 - self.nbits);
-        }
-    }
-    fn finish(mut self) -> Vec<u8> {
-        if self.nbits != 0 {
-            self.buf.push((self.acc << (8 - self.nbits)) as u8);
-        }
-        self.buf
-    }
+    let total = (w as usize * h as usize) as f64;
+    let entropy = hist
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / total;
+            -p * p.log2()
+        })
+        .sum::<f64>();
+    let uniq = hist.iter().filter(|&&c| c > 0).count();
+    eprintln!("{w}x{h}, uniq={uniq}, H≈{:.2} bits/px", entropy);
+    let mut top: Vec<(u8, usize)> = hist
+        .iter()
+        .enumerate()
+        .filter(|&(_, c)| *c > 0)
+        .map(|(i, c)| (i as u8, *c))
+        .collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("Top: {:?}", &top[..top.len().min(10)]);
+    Ok(())
 }
 
-struct BitReader<'a> {
-    s: &'a [u8],
-    byte: usize,
-    acc: u32,
-    nbits: u8,
-}
-impl<'a> BitReader<'a> {
-    fn new(s: &'a [u8]) -> Self {
-        Self {
-            s,
-            byte: 0,
-            acc: 0,
-            nbits: 0,
-        }
+// ---- palette helpers ----
+fn build_palette(pixels: &[u8], k: usize) -> ([u8; 16], usize) {
+    let mut hist = [0usize; 256];
+    for &v in pixels {
+        hist[v as usize] += 1;
     }
-    fn read(&mut self, n: u8) -> anyhow::Result<u32> {
-        while self.nbits < n {
-            if self.byte >= self.s.len() {
-                anyhow::bail!("Bitstream truncated");
-            }
-            self.acc = (self.acc << 8) | self.s[self.byte] as u32;
-            self.byte += 1;
-            self.nbits += 8;
-        }
-        let shift = self.nbits - n;
-        let mask = (1u32 << n) - 1;
-        let bits = (self.acc >> shift) & mask;
-        self.nbits -= n;
-        self.acc &= (1u32 << self.nbits) - 1;
-        Ok(bits)
+    let mut v: Vec<(u8, usize)> = hist
+        .iter()
+        .enumerate()
+        .filter(|&(_, c)| *c > 0)
+        .map(|(i, c)| (i as u8, *c))
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut pal = [0u8; 16];
+    let n = v.len().min(k.min(16));
+    for i in 0..n {
+        pal[i] = v[i].0;
     }
-    fn read_bit(&mut self) -> anyhow::Result<u32> {
-        self.read(1)
-    }
-    fn read_u8(&mut self) -> anyhow::Result<u8> {
-        Ok(self.read(8)? as u8)
-    }
-    fn read_gamma(&mut self) -> anyhow::Result<u32> {
-        // gamma decode: zeros until first 1, then read payload of that many bits-1
-        let mut z = 0u32;
-        loop {
-            let b = self.read_bit()?;
-            if b == 0 {
-                z += 1;
-            } else {
-                break;
-            }
-        }
-        let payload = if z == 0 { 0 } else { self.read(z as u8)? };
-        Ok((1u32 << z) | payload)
-    }
-    fn align_byte(&mut self) {
-        let _ = if self.nbits % 8 != 0 {
-            self.read(self.nbits % 8)
-        } else {
-            Ok(0)
-        };
-    }
+    (pal, n)
 }
 
-// ===================== Predictors & residuals =====================
-#[derive(Copy, Clone, Debug)]
-enum Pred {
-    None,
-    Sub,
-    Up,
-    Avg,
-}
-
-fn make_residuals(pred: Pred, row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
-    let w = row.len();
-    let mut out = Vec::with_capacity(w);
-    match pred {
-        Pred::None => out.extend_from_slice(row),
-        Pred::Sub => {
-            let mut left = 0u8;
-            for &v in row {
-                let r = v.wrapping_sub(left);
-                out.push(r);
-                left = v;
-            }
-        }
-        Pred::Up => {
-            if let Some(p) = prev_row {
-                for x in 0..w {
-                    out.push(row[x].wrapping_sub(p[x]));
-                }
-            } else {
-                out.extend_from_slice(row);
-            }
-        }
-        Pred::Avg => {
-            if let Some(p) = prev_row {
-                let mut left = 0u8;
-                for x in 0..w {
-                    let up = p[x];
-                    let avg = (((left as u16 + up as u16) >> 1) & 0xFF) as u8;
-                    out.push(row[x].wrapping_sub(avg));
-                    left = row[x];
-                }
-            } else {
-                // first row: SUB-like
-                let mut left = 0u8;
-                for &v in row {
-                    let r = v.wrapping_sub(left);
-                    out.push(r);
-                    left = v;
-                }
-            }
-        }
-    }
-    out
-}
-
-// Cheap row cost estimator for choosing predictor (matches our 3-opcode set)
-#[inline]
-fn gamma_bits(n: u32) -> usize {
-    let b = 32 - n.leading_zeros();
-    (2 * b - 1) as usize
-}
-
-fn estimate_row_bits(res: &[u8]) -> usize {
-    let mut bits = 0usize;
-    let mut i = 0usize;
-    while i < res.len() {
-        if res[i] == 0 {
-            let mut l = 0usize;
-            while i < res.len() && res[i] == 0 {
-                l += 1;
-                i += 1;
-            }
-            bits += 1 + gamma_bits(l as u32); // ZRUN: "0" + gamma(L)
-            continue;
-        }
-        // COPY estimate
-        let mut best_len = 0usize;
-        let max_back = i.min(255);
-        let max_len = (res.len() - i).min(255);
-        for d in 1..=max_back {
-            let mut l = 0usize;
-            while i + l < res.len() && res[i + l] == res[i + l - d] && l < max_len {
-                l += 1;
-            }
-            if l >= 3 && l > best_len {
-                best_len = l;
-                if l == max_len {
+fn map_to_palette(pixels: &[u8], pal: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pixels.len());
+    for &px in pixels {
+        let mut best = 0usize;
+        let mut bestd = i16::MAX;
+        for (i, &p) in pal.iter().enumerate() {
+            let d = (px as i16 - p as i16).abs();
+            if d < bestd {
+                bestd = d;
+                best = i;
+                if d == 0 {
                     break;
                 }
             }
         }
-        if best_len >= 3 {
-            bits += 3 + 8 + gamma_bits(best_len as u32); // prefix 110 + dist + gamma(L)
-            i += best_len;
-            continue;
-        }
-        // LITERAL group until a compressible event
-        let start = i;
-        let mut l = 1usize;
-        i += 1;
-        while i < res.len() {
-            if res[i] == 0 {
-                break;
-            }
-            // if COPY likely soon, stop literal early
-            let look_copy = {
-                let max_back = i.min(255);
-                let max_len = (res.len() - i).min(255);
-                let mut m = 0usize;
-                for d in 1..=max_back {
-                    let mut ll = 0usize;
-                    while i + ll < res.len() && res[i + ll] == res[i + ll - d] && ll < max_len {
-                        ll += 1;
-                    }
-                    if ll > m {
-                        m = ll;
-                        if m >= 4 {
-                            break;
-                        }
-                    }
-                }
-                m >= 4
-            };
-            if look_copy {
-                break;
-            }
-            i += 1;
-            l += 1;
-        }
-        let _ = &res[start..start + l];
-        bits += 2 + gamma_bits(l as u32) + 8 * l; // "10" + gamma(L) + L bytes
+        out.push(best as u8);
     }
-    bits
-}
-
-// ===================== Encoder =====================
-pub fn encode_oi(pixels: &[u8], w: u32, h: u32) -> Vec<u8> {
-    debug_assert_eq!(pixels.len(), (w as usize) * (h as usize));
-    let mut out = Vec::with_capacity(16 + pixels.len() / 2 + 64);
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&w.to_be_bytes());
-    out.extend_from_slice(&h.to_be_bytes());
-    out.push(0); // cs=0
-    out.extend_from_slice(&[0, 0, 0]);
-
-    if pixels.is_empty() {
-        out.extend_from_slice(&OI_END);
-        return out;
-    }
-
-    let width = w as usize;
-    let mut bw = BitWriter::new();
-    let mut prev_row: Option<Vec<u8>> = None;
-
-    for row_idx in 0..(h as usize) {
-        let row = &pixels[row_idx * width..(row_idx + 1) * width];
-        let prev = prev_row.as_deref();
-
-        // choose predictor by estimated bit cost
-        let cand = [
-            (Pred::None, make_residuals(Pred::None, row, prev)),
-            (Pred::Sub, make_residuals(Pred::Sub, row, prev)),
-            (Pred::Up, make_residuals(Pred::Up, row, prev)),
-            (Pred::Avg, make_residuals(Pred::Avg, row, prev)),
-        ];
-        let (best_pred, res) = cand
-            .iter()
-            .map(|(p, r)| (*p, r.as_slice(), estimate_row_bits(r)))
-            .min_by_key(|(_, _, bits)| *bits)
-            .map(|(p, r, _)| (p, r.to_vec()))
-            .unwrap();
-
-        match best_pred {
-            Pred::None => bw.write(0b00, 2),
-            Pred::Sub => bw.write(0b01, 2),
-            Pred::Up => bw.write(0b10, 2),
-            Pred::Avg => bw.write(0b11, 2),
-        }
-
-        encode_row_into(&mut bw, &res);
-        prev_row = Some(row.to_vec());
-    }
-
-    bw.byte_align();
-    out.extend_from_slice(&bw.finish());
-    out.extend_from_slice(&OI_END);
     out
 }
 
-fn find_best_copy(res: &[u8], i: usize) -> Option<(usize /*dist*/, usize /*len*/)> {
-    if i == 0 {
-        return None;
-    }
-    let max_back = i.min(255);
-    let max_len = (res.len() - i).min(255);
-    let mut best_len = 0usize;
-    let mut best_dist = 0usize;
-    for d in 1..=max_back {
-        let mut l = 0usize;
-        while i + l < res.len() && res[i + l] == res[i + l - d] && l < max_len {
-            l += 1;
-        }
-        if l >= 3 && l > best_len {
-            best_len = l;
-            best_dist = d;
-            if l == max_len {
-                break;
+// ---- encoder ----
+fn encode_v3(indices: &[u8], w: u32, h: u32, bg_guess: u8) -> Vec<u8> {
+    let width = w as usize;
+    let mut out = Vec::with_capacity(indices.len() / 2);
+    for row in 0..h as usize {
+        let start = row * width;
+        let end = start + width;
+        let mut i = start;
+        while i < end {
+            let idx = indices[i];
+            // try RUN >=4
+            let mut j = i + 1;
+            while j < end && indices[j] == idx {
+                j += 1;
             }
-        }
-    }
-    if best_len >= 3 {
-        Some((best_dist, best_len))
-    } else {
-        None
-    }
-}
-
-fn encode_row_into(bw: &mut BitWriter, res: &[u8]) {
-    let mut i = 0usize;
-    while i < res.len() {
-        // ZRUN
-        if res[i] == 0 {
-            let mut l = 1usize;
-            while i + l < res.len() && res[i + l] == 0 {
-                l += 1;
-            }
-            bw.write_bit(false); // "0"
-            bw.write_gamma(l as u32);
-            i += l;
-            continue;
-        }
-
-        // COPY first (beats literal if worthwhile)
-        if let Some((dist, len)) = find_best_copy(res, i) {
-            let copy_bits = 3 + 8 + gamma_bits(len as u32);
-            let lit_bits = 2 + gamma_bits(len as u32) + 8 * len;
-            if copy_bits < lit_bits {
-                bw.write(0b110, 3);
-                bw.write(dist as u32, 8);
-                bw.write_gamma(len as u32);
-                i += len;
+            let run = j - i;
+            if run >= 4 {
+                push_hdr(&mut out, Kind::Run);
+                out.push(idx);
+                write_varint(&mut out, run as u32);
+                i = j;
                 continue;
             }
-        }
-
-        // LITERAL: grow until a compressible event
-        let start = i;
-        let mut l = 1usize;
-        i += 1;
-        while i < res.len() {
-            if res[i] == 0 {
-                break;
-            }
-            if let Some((_d, mlen)) = find_best_copy(res, i) {
-                if mlen >= 4 {
+            // otherwise BITPACK a chunk until next long run
+            let mut k = i + 1;
+            while k < end {
+                if k + 3 < end
+                    && indices[k] == indices[k + 1]
+                    && indices[k + 1] == indices[k + 2]
+                    && indices[k + 2] == indices[k + 3]
+                {
                     break;
                 }
+                k += 1;
             }
-            i += 1;
-            l += 1;
+            push_hdr(&mut out, Kind::Bitpack);
+            write_varint(&mut out, (k - i) as u32);
+            bitpack_indices(&mut out, &indices[i..k]);
+            i = k;
         }
-        bw.write(0b10, 2);
-        bw.write_gamma(l as u32);
-        for &v in &res[start..start + l] {
-            bw.write_u8(v);
+    }
+    out
+}
+
+fn push_hdr(out: &mut Vec<u8>, kind: Kind) {
+    out.push((kind as u8) << 6);
+}
+
+fn write_varint(dst: &mut Vec<u8>, mut v: u32) {
+    while v >= 0x80 {
+        dst.push(((v as u8) & 0x7F) | 0x80);
+        v >>= 7;
+    }
+    dst.push(v as u8);
+}
+
+fn bitpack_indices(dst: &mut Vec<u8>, idx: &[u8]) {
+    // Determine minimal bits per index from local max (but keep simple: use global max of slice)
+    let mut maxv = 0u8;
+    for &x in idx {
+        if x > maxv {
+            maxv = x;
         }
+    }
+    let bits = (32 - (maxv as u32).leading_zeros()).max(1) as u8; // 1..8
+    dst.push(bits); // store bits used for this block
+    let mut acc: u32 = 0;
+    let mut acc_bits: u8 = 0;
+    for &x in idx {
+        acc |= (x as u32) << acc_bits;
+        acc_bits += bits;
+        while acc_bits >= 8 {
+            dst.push((acc & 0xFF) as u8);
+            acc >>= 8;
+            acc_bits -= 8;
+        }
+    }
+    if acc_bits > 0 {
+        dst.push(acc as u8);
     }
 }
 
-// ===================== Decoder =====================
-pub fn decode_oi(data: &[u8]) -> anyhow::Result<(u32, u32, Vec<u8>)> {
-    if data.len() < 16 || &data[0..4] != MAGIC.as_slice() {
-        anyhow::bail!("Not an OI file (bad magic)");
-    }
-    let w = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-    let h = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-    // cs = data[12]; // currently only 0
-    let mut br = BitReader::new(&data[16..]);
+// ---- decoder ----
+fn decode_v3(payload: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     let width = w as usize;
-    let mut out = Vec::with_capacity((w as usize) * (h as usize));
-    let mut prev_row_out: Option<Vec<u8>> = None;
-
-    for _row in 0..h {
-        let pred_bits = br.read(2)? as u8;
-        let pred = match pred_bits {
-            0b00 => Pred::None,
-            0b01 => Pred::Sub,
-            0b10 => Pred::Up,
-            0b11 => Pred::Avg,
-            _ => unreachable!(),
-        };
-
-        let mut row: Vec<u8> = Vec::with_capacity(width);
-        while row.len() < width {
-            let b1 = br.read_bit()?;
-            if b1 == 0 {
-                // ZRUN
-                let l = br.read_gamma()? as usize;
-                row.extend(std::iter::repeat(0u8).take(l));
-            } else {
-                let b2 = br.read_bit()?;
-                if b2 == 0 {
-                    // LITERAL
-                    let l = br.read_gamma()? as usize;
-                    for _ in 0..l {
-                        row.push(br.read_u8()?);
+    let mut out = vec![0u8; (w * h) as usize];
+    let mut p = 0usize;
+    for row in 0..h as usize {
+        let mut x = 0usize;
+        while x < width {
+            if p >= payload.len() {
+                return Err(anyhow!("eos"));
+            }
+            let hdr = payload[p];
+            p += 1;
+            let kind = match (hdr >> 6) & 0b11 {
+                0 => Kind::Run,
+                1 => Kind::Bitpack,
+                2 => Kind::MixRun,
+                _ => return Err(anyhow!("bad kind")),
+            };
+            match kind {
+                Kind::Run | Kind::MixRun => {
+                    if p >= payload.len() {
+                        return Err(anyhow!("run idx missing"));
                     }
-                } else {
-                    // COPY (prefix 110: we've already seen '11', now ensure the next bit is 0)
-                    let b3 = br.read_bit()?;
-                    if b3 != 0 {
-                        anyhow::bail!("Reserved/unknown opcode (expected COPY 110)");
-                    }
-                    let dist = br.read(8)? as usize;
-                    let l = br.read_gamma()? as usize;
-                    if dist == 0 || dist > row.len() {
-                        anyhow::bail!("Bad COPY distance");
-                    }
-                    for _ in 0..l {
-                        let v = row[row.len() - dist];
-                        row.push(v);
+                    let idx = payload[p];
+                    p += 1;
+                    let (len_u, used) = read_varint(&payload[p..])?;
+                    p += used;
+                    for _ in 0..(len_u as usize) {
+                        out[row * width + x] = idx;
+                        x += 1;
                     }
                 }
-            }
-        }
-        // Reconstruct with predictor
-        match pred {
-            Pred::None => {
-                out.extend_from_slice(&row);
-                prev_row_out = Some(row);
-            }
-            Pred::Sub => {
-                let mut row_out = vec![0u8; width];
-                let mut left = 0u8;
-                for x in 0..width {
-                    let px = row[x].wrapping_add(left);
-                    row_out[x] = px;
-                    left = px;
-                }
-                out.extend_from_slice(&row_out);
-                prev_row_out = Some(row_out);
-            }
-            Pred::Up => {
-                let mut row_out = vec![0u8; width];
-                if let Some(prev_row) = prev_row_out.as_ref() {
-                    for x in 0..width {
-                        row_out[x] = row[x].wrapping_add(prev_row[x]);
+                Kind::Bitpack => {
+                    let (len_u, used) = read_varint(&payload[p..])?;
+                    p += used;
+                    if p >= payload.len() {
+                        return Err(anyhow!("bitpack bits missing"));
                     }
-                } else {
-                    row_out.copy_from_slice(&row);
-                }
-                out.extend_from_slice(&row_out);
-                prev_row_out = Some(row_out);
-            }
-            Pred::Avg => {
-                let mut row_out = vec![0u8; width];
-                if let Some(prev_row) = prev_row_out.as_ref() {
-                    let mut left = 0u8;
-                    for x in 0..width {
-                        let up = prev_row[x];
-                        let avg = (((left as u16 + up as u16) >> 1) & 0xFF) as u8;
-                        let px = row[x].wrapping_add(avg);
-                        row_out[x] = px;
-                        left = px;
+                    let bits = payload[p];
+                    p += 1;
+                    let mut need_bits = len_u as usize * bits as usize;
+                    let mut acc: u32 = 0;
+                    let mut acc_bits = 0usize;
+                    let mut consumed = 0usize;
+                    while consumed < len_u as usize {
+                        if acc_bits < bits as usize {
+                            if p >= payload.len() {
+                                return Err(anyhow!("bitpack data underrun"));
+                            }
+                            acc |= (payload[p] as u32) << acc_bits;
+                            p += 1;
+                            acc_bits += 8;
+                        }
+                        let mask = (1u32 << bits) - 1;
+                        let val = ((acc & mask) as u8);
+                        acc >>= bits;
+                        acc_bits -= bits as usize;
+                        out[row * width + x] = val;
+                        x += 1;
+                        consumed += 1;
                     }
-                } else {
-                    let mut left = 0u8;
-                    for x in 0..width {
-                        let px = row[x].wrapping_add(left);
-                        row_out[x] = px;
-                        left = px;
-                    }
+                    // ignore leftover bits in acc
                 }
-                out.extend_from_slice(&row_out);
-                prev_row_out = Some(row_out);
+                _ => unreachable!(),
             }
         }
     }
-
-    // Align to the next byte, then compute consumed bytes precisely
-    br.align_byte();
-    let consumed = 16 + br.byte; // bytes read from the slice (after alignment)
-
-    if consumed + 8 > data.len() {
-        anyhow::bail!("Truncated after rows");
-    }
-    if &data[consumed..consumed + 8] != &OI_END {
-        anyhow::bail!("Missing END marker");
-    }
-
-    Ok((w, h, out))
+    Ok(out)
 }
 
-// ===================== Tests =====================
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Deterministic RNG
-    struct Rng(u32);
-    impl Rng {
-        fn new(seed: u32) -> Self {
-            Rng(seed)
+fn read_varint(mut buf: &[u8]) -> Result<(u32, usize)> {
+    let mut shift = 0u32;
+    let mut val = 0u32;
+    let mut used = 0usize;
+    loop {
+        if buf.is_empty() {
+            return Err(anyhow!("varint underflow"));
         }
-        fn next_u32(&mut self) -> u32 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            self.0 = x;
-            x
+        let b = buf[0];
+        buf = &buf[1..];
+        used += 1;
+        val |= ((b & 0x7F) as u32) << shift;
+        if b & 0x80 == 0 {
+            break;
         }
-        fn next_u8(&mut self) -> u8 {
-            (self.next_u32() & 0xFF) as u8
-        }
-        fn fill(&mut self, buf: &mut [u8]) {
-            for b in buf {
-                *b = self.next_u8();
-            }
+        shift += 7;
+        if shift > 28 {
+            return Err(anyhow!("varint too large"));
         }
     }
-
-    fn roundtrip(pixels: &[u8], w: u32, h: u32) {
-        assert_eq!(
-            pixels.len(),
-            (w as usize) * (h as usize),
-            "pixels.len() must equal w*h"
-        );
-        let enc = encode_oi(pixels, w, h);
-        assert_eq!(&enc[0..4], &MAGIC);
-        let (dw, dh, dec) = decode_oi(&enc).expect("decode");
-        assert_eq!((dw, dh), (w, h));
-        assert_eq!(dec, pixels);
-        assert_eq!(&enc[enc.len() - 8..], &OI_END);
-    }
-
-    #[test]
-    fn small_opcodes_and_copy() {
-        // Single row exercising ZRUN, LITERAL, COPY
-        let mut row = vec![];
-        row.extend_from_slice(&[0; 7]); // ZRUN
-        row.extend_from_slice(&[10, 11, 12, 13]); // LITERAL
-        row.extend_from_slice(&[10, 11, 12, 13]); // COPY candidate
-        roundtrip(&row, row.len() as u32, 1);
-    }
-
-    #[test]
-    fn predictors_patterns() {
-        // SUB-strong rows
-        let (w, h) = (64u32, 4u32);
-        let mut img = vec![0u8; (w * h) as usize];
-        for y in 0..h {
-            let mut v = (y * 5) as u8;
-            for x in 0..w {
-                img[(y * w + x) as usize] = v;
-                v = v.wrapping_add(1);
-            }
-        }
-        roundtrip(&img, w, h);
-
-        // UP-strong: vertical gradient
-        let (w2, h2) = (16u32, 32u32);
-        let mut img2 = vec![0u8; (w2 * h2) as usize];
-        for y in 0..h2 {
-            for x in 0..w2 {
-                img2[(y * w2 + x) as usize] = (y as u8) * 3;
-            }
-        }
-        roundtrip(&img2, w2, h2);
-
-        // AVG-ish checker
-        let (w3, h3) = (32u32, 16u32);
-        let mut img3 = vec![0u8; (w3 * h3) as usize];
-        for y in 0..h3 {
-            for x in 0..w3 {
-                let up = if y > 0 {
-                    img3[((y - 1) * w3 + x) as usize]
-                } else {
-                    0
-                };
-                let left = if x > 0 {
-                    img3[(y * w3 + x - 1) as usize]
-                } else {
-                    0
-                };
-                let avg = (((up as u16 + left as u16) / 2) as u8).wrapping_add(((x ^ y) as u8) & 1);
-                img3[(y * w3 + x) as usize] = avg;
-            }
-        }
-        roundtrip(&img3, w3, h3);
-    }
-
-    #[test]
-    fn copy_repeats() {
-        let tile: [u8; 8] = [5, 5, 6, 6, 7, 7, 6, 6];
-        let mut row = Vec::new();
-        row.extend_from_slice(&[9, 11, 9, 11]);
-        for _ in 0..6 {
-            row.extend_from_slice(&tile);
-        }
-        row.extend_from_slice(&[33, 44, 55, 66]);
-        roundtrip(&row, row.len() as u32, 1);
-    }
-
-    #[test]
-    fn random_images() {
-        let mut rng = Rng::new(0xC0FFEE);
-        for &(w, h) in &[(1, 1), (3, 2), (7, 5), (16, 16), (31, 9), (64, 32)] {
-            let mut img = vec![0u8; (w * h) as usize];
-            rng.fill(&mut img);
-            roundtrip(&img, w, h);
-        }
-    }
-
-    #[test]
-    fn container_and_end_marker() {
-        let w = 10;
-        let h = 3;
-        let pixels: Vec<u8> = (0..(w * h)).map(|i| (i * 7 % 256) as u8).collect();
-        let enc = encode_oi(&pixels, w, h);
-        assert_eq!(&enc[0..4], &MAGIC);
-        assert_eq!(&enc[enc.len() - 8..], &OI_END);
-        let (dw, dh, out) = decode_oi(&enc).unwrap();
-        assert_eq!((dw, dh), (w, h));
-        assert_eq!(out, pixels);
-    }
+    Ok((val, used))
 }
