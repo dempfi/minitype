@@ -6,6 +6,7 @@
 [dependencies]
   anyhow = "1.0.99"
   clap = { version = "4.5", features = ["derive"] }
+  flate2 = "1"
   image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
@@ -14,3 +15,4 @@
     "tiff",
     "bmp",
   ] }
+  zstd = { version = "0.13", features = ["legacy"] }
