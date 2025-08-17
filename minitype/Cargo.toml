@@ -1,0 +1,11 @@
+[package]
+  keywords = ["embedded"]
+  name     = "minitype"
+
+  documentation.workspace = true
+  edition.workspace       = true
+  homepage.workspace      = true
+  license.workspace       = true
+  readme.workspace        = true
+  repository.workspace    = true
+  version.workspace       = true
