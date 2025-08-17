@@ -3,6 +3,7 @@
   "letter_spacing": 1,
   "ascent": 12,
   "descent": -4,
+  "charset": [{ "start": "!", "end": "~" }],
   "glyphs": [
     { "ch": "A", "x": 0, "w": 8 },
     { "ch": "B", "x": 9, "w": 7 },

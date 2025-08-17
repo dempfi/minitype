@@ -1,260 +1,180 @@
-# ZAF Font Specification (v1)
+# ZAF Font Specification
 
-This document defines the ZAF Font container (ZFNT) and its embedded ZAF Atlas (“inner ZAF”) payload for compact, MCU-friendly bitmap fonts with precomputed antialiasing.
+This document defines the **ZAF Font container (ZFNT)** and its embedded **ZAF Atlas** (the “inner ZAF”) payload for compact, MCU‑friendly bitmap fonts with precomputed antialiasing.
 
-- Use case: small embedded devices rendering monochrome/antialiased glyphs from a pre-baked horizontal atlas.
-- Design goals: tiny decoder, deterministic parsing, fixed endianness, minimal per-glyph metadata, streaming-friendly atlas decode.
+- **Use case:** small embedded devices rendering monochrome/antialiased glyphs from a pre‑baked horizontal atlas.
+- **Design goals:** tiny decoder, deterministic parsing, fixed endianness, minimal per‑glyph metadata, streaming‑friendly atlas decode.
 
 ---
 
 ## 1. Conventions
 
-- Byte order: All multi-byte integers are little-endian.
-- Bit order (inner payload): All bitfields in the atlas payload are LSB-first (least significant bit written/read first).
-- Units: Pixels unless stated otherwise.
-- Integer types: u8, u16, u24 (3-byte little-endian), i16, u32.
+- **Byte order:** Little‑endian for all multi‑byte integers.
+- **Bit order (inner payload):** LSB‑first (least significant bit written/read first).
+- **Units:** Pixels unless stated otherwise.
+- **Integer types:** `u8`, `u16`, `u24` (3‑byte little‑endian), `i16`, `u32`.
 
 ---
 
-## 2. High-level layout
+## 2. High‑level layout
 
-A ZAF Font file is a single binary blob:
+A ZFNT file is one binary blob composed of:
 
 ```
 +--------------------+
-| ZFNT Header        | 28 bytes
+| ZFNT Header        | 46 bytes fixed + 7×charset_seg_count
 +--------------------+
-| Glyph Table        | glyph_count × 6 bytes
+| Charset Segments   | charset_seg_count × 7 bytes (inside header region)
 +--------------------+
-| Inner ZAF Atlas    | ≥ 21 bytes (see §4)
+| Glyph Table        | glyph_count × 4 bytes
++--------------------+
+| Inner ZAF Atlas    | ≥ 21 bytes (see §5)
++--------------------+
+| Kerning Pairs      | kerning_count × 7 bytes (optional)
 +--------------------+
 ```
 
-There is no alignment padding between sections.
+There is no padding between sections. Offsets and lengths are recorded in the header so readers can seek directly.
 
 ---
 
-### 3. ZFNT Header (28 bytes)
+## 3. ZFNT Header (variable length)
 
-| Offset | Size | Type  | Name               | Description                                               |
-| ------ | ---- | ----- | ------------------ | --------------------------------------------------------- |
-| 0x00   | 4    | bytes | MAGIC              | ASCII ZFNT                                                |
-| 0x04   | 1    | u8    | VERSION            | File format version. Must be 1 for this spec.             |
-| 0x05   | 1    | u8    | FLAGS              | Reserved, must be 0.                                      |
-| 0x06   | 2    | u16   | line_height        | Baseline-to-baseline distance.                            |
-| 0x08   | 2    | i16   | letter_spacing     | Additional horizontal spacing per glyph.                  |
-| 0x0A   | 2    | i16   | ascent             | Pixels above baseline (non-negative recommended).         |
-| 0x0C   | 2    | i16   | descent            | Pixels below baseline (non-positive recommended).         |
-| 0x0E   | 2    | u16   | glyph_count        | Number of glyph records.                                  |
-| 0x10   | 4    | u32   | glyph_table_offset | Absolute offset of the first glyph record (usually 0x1C). |
-| 0x14   | 4    | u32   | atlas_offset       | Absolute offset of the inner ZAF atlas payload (§4).      |
-| 0x18   | 4    | u32   | total_len          | Total file length in bytes (for quick bounds checks).     |
+The header begins with a 46‑byte **fixed portion**, immediately followed by `charset_seg_count` charset segment records (7 bytes each). After the segments comes the glyph table.
 
-Notes
+| Offset | Size | Type  | Name                   | Description                                           |
+| -----: | ---: | :---- | ---------------------- | ----------------------------------------------------- |
+|   0x00 |    4 | bytes | **MAGIC**              | ASCII `ZFNT`                                          |
+|   0x04 |    1 | u8    | **VERSION**            | File format version. **Must be 1** for this spec.     |
+|   0x05 |    1 | u8    | **FLAGS**              | Reserved = 0                                          |
+|   0x06 |    2 | u16   | **line_height**        | Baseline‑to‑baseline distance.                        |
+|   0x08 |    2 | i16   | **letter_spacing**     | Additional horizontal spacing per glyph.              |
+|   0x0A |    2 | i16   | **ascent**             | Pixels above baseline (non‑negative recommended).     |
+|   0x0C |    2 | i16   | **descent**            | Pixels below baseline (non‑positive recommended).     |
+|   0x0E |    2 | u16   | **glyph_count**        | Number of glyph records.                              |
+|   0x10 |    4 | u32   | **glyph_table_offset** | Absolute offset of the first glyph record.            |
+|   0x14 |    4 | u32   | **glyph_table_len**    | Total bytes of the glyph table (== 4 × glyph_count).  |
+|   0x18 |    4 | u32   | **atlas_offset**       | Absolute offset of the inner ZAF atlas payload (§5).  |
+|   0x1C |    4 | u32   | **atlas_len**          | Total bytes of the inner ZAF atlas payload.           |
+|   0x20 |    4 | u32   | **total_len**          | Total file length in bytes (for quick bounds checks). |
+|   0x24 |    4 | u32   | **kerning_offset**     | Absolute offset of kerning block, or 0 if none.       |
+|   0x28 |    4 | u32   | **kerning_count**      | Number of kerning pairs; each is 7 bytes (see §6).    |
+|   0x2C |    2 | u16   | **charset_seg_count**  | Number of charset segments that immediately follow.   |
+|   0x2E |  7×N | —     | **charset_segments**   | N = charset_seg_count; see **§4** for record format.  |
 
-- Metrics apply to the entire font. Kerning is not modeled.
-- The atlas is a single-row strip; baseline is baked in the strip and the atlas height equals ascent + (-descent) (or close); see §5.
-
----
-
-## 4. Glyph Table
-
-Immediately follows the header at glyph_table_offset. Contains glyph_count fixed-size records, 6 bytes each:
-
-Byte(s) Type Field Range / Meaning
-0..2 u24 codepoint Unicode scalar value 0..=0x10_FFFF (no surrogate values).
-3..4 u16 x X-offset in the atlas strip where glyph run begins.
-5 u8 w Glyph width in pixels, 0..=255.
-
-Semantics & constraints
-
-- x + w must be ≤ atlas.width.
-- Records may appear in any order; duplicates by codepoint are invalid.
-- The atlas strip is a single row; y=0 for all glyphs (baseline baked). No per-glyph y/height fields exist.
+> **Note:** The header length is `0x2E + 7×charset_seg_count`. The **glyph table** begins exactly at `glyph_table_offset`, which equals that header length.
 
 ---
 
-## 5. Inner ZAF Atlas (“ZAF” payload)
+## 4. Charset Segments (always present)
 
-This is a self-contained grayscale atlas codec embedded at atlas_offset.
+ZFNT v3 **always** uses a charset‑based mapping; per‑glyph Unicode codepoints are not stored in the glyph table. Instead, a compact segment table maps **contiguous** Unicode ranges to sequential glyph indices.
 
-### 5.1 Inner header (21 bytes)
+Each charset segment record is 7 bytes:
 
-| Offset | Size | Type | Name     | Description                                    |
-| ------ | ---- | ---- | -------- | ---------------------------------------------- |
-| 0      | 2    | u16  | width    | Atlas width in pixels.                         |
-| 2      | 2    | u16  | height   | Atlas height in pixels.                        |
-| 4      | 1    | u8   | k Global | Golomb–Rice parameter 0..=7.                   |
-| 5      | 16   | u8[] | palette  | 16 grayscale values (u8), most frequent first. |
+| Bytes | Type | Field      | Meaning                                                         |
+| :---: | :--: | ---------- | --------------------------------------------------------------- |
+| 0..2  | u24  | start_cp   | First Unicode scalar value in the range (inclusive).            |
+| 2..5  | u16  | len        | Number of codepoints in this segment (≥1).                      |
+| 5..7  | u16  | glyph_base | Glyph index of `start_cp`. Next codepoints follow sequentially. |
 
-Followed by a variable-length payload bitstream.
+**Total covered codepoints** across all segments **must equal** `glyph_count`.
 
-### 5.2 Payload bitstream (LSB-first)
-
-The image is first mapped to a 16-entry palette of bytes (nearest by absolute difference), then run-length encoded over palette indices (0..=15) with Golomb–Rice coded lengths.
-
-Each run is encoded as:
+**Runtime lookup:** For codepoint `cp`, find the segment where `start_cp ≤ cp < start_cp + len`, then:
 
 ```
-[majority:1] [idx:4?] [Rice(length-1; k)]
+index = glyph_base + (cp - start_cp)
 ```
 
-- majority = 1 encodes palette index 0 without an explicit index.
-- majority = 0 is followed by a 4-bit idx value in 1..=15.
-- Run length is RiceDecode(k) + 1.
-- All bits are packed LSB-first into bytes.
-
-Decoding stops after emitting width \* height pixels. Each pixel value is the palette byte at the decoded index. Output is row-major, left-to-right, top-to-bottom.
-
-### 5.3 Encoder guidance (non-normative but canonical)
-
-- Build a 256-bin histogram; choose the 16 most frequent bytes; tie-break by byte value ascending.
-- Map each source pixel to the palette entry with smallest absolute difference; tie-break by lower palette index.
-- Produce runs across the entire buffer row-major (runs may cross row boundaries).
-- Set k = round(log2(max(1, mean_run_length))), clamped to [0,7].
-
-### 5.4 Decoder validation (normative)
-
-A compliant decoder must:
-
-- Validate header has ≥21 bytes.
-- Ensure palette array is present (16 bytes).
-- Track emitted pixel count and fail on:
-- Palette index ≥ 16.
-- Run overruns output (emitted + len > width\*height).
-- Unexpected EOF in bitstream.
-- Return (width, height, pixels) where pixels.len() == width\*height.
+If no segment matches, the glyph is not covered by this font; a renderer may use a fallback font.
 
 ---
 
-## 6. Rendering Model
+## 5. Glyph Table (4 bytes / glyph)
 
-- The atlas is a single horizontal strip drawn with baseline baked at y=0. The atlas height represents the full ascent+descent (rounded as encoded by the producer).
-- To render glyph G:
-  1.  Look up its record by codepoint.
-  2.  Blit rectangle [x .. x+w) × [0 .. height) from the atlas to the destination at (pen_x, pen_y - ascent), or equivalently place the atlas row such that the font baseline aligns with destination baseline.
-  3.  Advance pen_x += w + letter_spacing.
-      - Alpha blending uses the 8-bit value from the decoded atlas.
+Immediately after the charset segments. Contains `glyph_count` fixed‑size records, 4 bytes each:
 
----
+| Bytes | Type | Field   | Range / Meaning                                     |
+| :---: | :--: | ------- | --------------------------------------------------- |
+| 0..2  | u16  | x       | X‑offset in the atlas strip where glyph run begins. |
+|   2   |  u8  | w       | Glyph width in pixels (0..=255).                    |
+|   3   |  i8  | advance | Signed horizontal advance for this glyph.           |
 
-## 7. File-level Validation Rules
+**Constraints**
 
-On parsing the outer container: 1. MAGIC == "ZFNT". 2. VERSION == 1; FLAGS == 0. 3. glyph_table_offset >= 0x1C and glyph_table_offset <= atlas_offset. 4. total_len == file_length (recommended hard check). 5. glyph_count \* 6 bytes exist starting at glyph_table_offset. 6. atlas_offset + 21 <= total_len. 7. For each glyph:
-
-- codepoint is a valid Unicode scalar (not 0xD800..=0xDFFF).
-- No duplicate codepoint.
-- x + w <= atlas.width (after decoding inner header). 8. Metrics are not otherwise constrained, but typical expectations:
-- line_height >= ascent - descent.
-- ascent >= 0, descent <= 0 (producer discipline).
-
-Implementations may reject files violating typical expectations.
+- `x + w ≤ atlas.width` (validated after decoding the inner header).
+- There is no per‑glyph `y` or `height`; the atlas is a single horizontal strip whose height equals the font’s ascent + |descent|.
 
 ---
 
-## 8. Limits & Recommendations
+## 6. Kerning Block (optional)
 
-- width, height are u16: max 65535 each.
-- Glyph width w is u8: max 255.
-- Prefer sorted by codepoint glyph table (not required).
-- No checksum is defined; total_len plus robust decode checks are the primary integrity guard.
-- To minimize RAM on MCU, decode atlas scanline by scanline if stored compressed externally; otherwise a one-shot decode into RAM is acceptable for small atlases.
+If present (`kerning_count > 0` and `kerning_offset != 0`), the kerning block is a sequence of 7‑byte pairs:
 
----
+| Bytes | Type | Field | Meaning                                                     |
+| :---: | :--: | ----- | ----------------------------------------------------------- |
+| 0..3  | u24  | left  | Left codepoint (Unicode scalar).                            |
+| 3..6  | u24  | right | Right codepoint (Unicode scalar).                           |
+|   6   |  i8  | adj   | Signed adjustment applied to advance when this pair occurs. |
 
-## 9. Pseudocode
-
-### 9.1 Parse ZFNT
-
-```pseudo
-function parse_zfnt(bytes):
-  assert len(bytes) >= 0x1C
-  assert bytes[0..4] == "ZFNT"
-  ver = bytes[4]; flags = bytes[5]
-  assert ver == 1 and flags == 0
-
-  line_height = u16LE(bytes[0x06..0x08])
-  letter_spacing = i16LE(bytes[0x08..0x0A])
-  ascent = i16LE(bytes[0x0A..0x0C])
-  descent = i16LE(bytes[0x0C..0x0E])
-  glyph_count = u16LE(bytes[0x0E..0x10])
-  gt_off = u32LE(bytes[0x10..0x14])
-  atlas_off = u32LE(bytes[0x14..0x18])
-  total_len = u32LE(bytes[0x18..0x1C])
-  assert total_len == len(bytes)
-  assert 0x1C <= gt_off <= atlas_off <= total_len
-
-  // Glyphs
-  glyphs = []
-  pos = gt_off
-  for i in 0..glyph_count-1:
-    cp = u24LE(bytes[pos..pos+3])
-    x = u16LE(bytes[pos+3..pos+5])
-    w = bytes[pos+5]
-    glyphs.push({cp, x, w})
-    pos += 6
-
-  // Decode inner ZAF header only to validate bounds
-  (aw, ah) = read_inner_header_dimensions(bytes[atlas_off..]) // §5.1, no payload decode yet
-
-  for g in glyphs:
-    assert g.w <= 255
-    assert g.x + g.w <= aw
-
-  return {metrics, glyphs, atlas_blob: bytes[atlas_off..total_len]}
-```
-
-### 9.2 Decode inner ZAF (full)
-
-```
-function decode_inner_zaf(blob):
-  assert len(blob) >= 21
-  w = u16LE(blob[0..2]); h = u16LE(blob[2..4])
-  k = blob[4]; palette = blob[5..21]
-  out = array<u8>(w\*h)
-
-  br = BitReaderLSB(blob[21..])
-  i = 0
-  while i < w*h:
-    maj = br.read_bit() // EOF -> error
-    idx = 0
-    if not maj:
-      idx = br.read_bits(4) // EOF -> error
-      assert idx in 1..15
-    len = rice_decode(br, k) + 1 // EOF -> error
-    assert i + len <= w*h
-    fill(out[i..i+len], palette[idx])
-    i += len
-  return (w, h, out)
-```
+Pairs are unordered; producers may store them sorted for binary search.
 
 ---
 
-## 10. Example Minimal File (illustrative)
+## 7. Inner ZAF Atlas (embedded image codec)
 
-- One glyph "A" (U+0041), width 5 at x=0.
-- Metrics: line_height=16, ascent=12, descent=-4, letter_spacing=1.
-- Atlas: 8×16 (numbers below are placeholders).
+The atlas carries a compact grayscale image with a tiny decoder. It begins at `atlas_offset` and has length `atlas_len`.
 
-```
-
-5A 46 4E 54 01 00 10 00 01 00 0C 00 FC FF 01 00
-1C 00 00 00 34 00 00 00 5E 00 00 00
-41 00 00 00 00 05
-08 00 10 00 03 00 11 22 33 ... (16 bytes palette) ... [payload...]
+### 7.1 Inner header (21 bytes)
 
 ```
+Offset  Size  Field                  Notes
+0       2     width (u16, LE)
+2       2     height (u16, LE)
+4       1     k                      Global Rice parameter, 0..7
+5       16    palette[16] (u8)       Raw grayscale values
+21..    *     payload bits           LSB‑first bitstream (see 7.2)
+```
 
-(Spaces added for readability; not a normative sample.)
+### 7.2 Payload bitstream (LSB‑first)
+
+The image is first mapped to a 16‑entry byte palette, then run‑length encoded over palette indices (0..15) with Golomb–Rice coded lengths. Majority index 0 is implicit for 1‑bit savings per run.
+
+Decoding stops after emitting `width × height` pixels. Output is row‑major.
 
 ---
 
-## 11. Producer Guidelines
+## 8. Rendering Model
 
-- Ensure the atlas is truly single-row strip; pack glyphs tightly left-to-right without gaps where possible.
-- Choose ascent, descent, and line_height to match your design; keep them consistent with the atlas height.
-- Validate w <= 255; if any glyph exceeds that, split or redesign.
-- Optionally store a JSON next to source assets during build; JSON is not part of ZAF but can look like:
+- The atlas is a single horizontal strip. Its height corresponds to **ascent + |descent|**. The strip’s baseline is implied by these metrics; producers typically place the baseline `ceil(ascent)` rows from the top.
+- To render codepoint **cp**:
+  1. Map **cp → glyph index** via the charset segments (see §4).
+  2. Load glyph `(x, w, advance)` at that index.
+  3. Blit rectangle `[x .. x+w) × [0 .. atlas.height)` from the atlas to destination at `(pen_x, pen_y - ascent)` so baselines align.
+  4. Apply kerning if a pair `(prev_cp, cp)` exists: `pen_x += adj`.
+  5. Advance: `pen_x += advance + letter_spacing`.
+- **Blend:** Use the atlas byte as straight alpha when compositing to the destination.
+
+---
+
+## 9. File‑level Validation Rules
+
+A compliant reader should:
+
+1. Check `MAGIC == "ZFNT"` and `VERSION == 1`.
+2. Ensure `total_len == file_length`.
+3. Ensure `glyph_table_offset ≥ 0x2E` and `glyph_table_offset == 0x2E + 7×charset_seg_count`.
+4. Ensure `glyph_table_len == 4 × glyph_count`.
+5. Ensure `atlas_offset == glyph_table_offset + glyph_table_len` and `atlas_offset + 21 ≤ total_len`.
+6. If `kerning_offset != 0`: ensure `kerning_offset ≥ atlas_offset + atlas_len` and space for `7 × kerning_count` exists.
+7. Decode only the inner header (7.1) to get `atlas.width/height`, then ensure for each glyph that `x + w ≤ atlas.width`.
+8. Metric sanity (recommended but not mandatory): `line_height ≥ ascent - descent`, `ascent ≥ 0`, `descent ≤ 0`.
+
+---
+
+## 10. Example JSON (producer‑side sidecar)
+
+This JSON is **not** part of ZFNT; it is used by the reference builder. With charset mode, glyphs omit codepoints entirely.
 
 ```json
 {
@@ -262,46 +182,21 @@ function decode_inner_zaf(blob):
   "letter_spacing": 1,
   "ascent": 12,
   "descent": -4,
+  "charset": [{ "start": " ", "end": "~" }],
   "glyphs": [
-    { "ch": "A", "x": 0, "w": 12 },
-    { "ch": "a", "x": 12, "w": 11 }
-  ]
+    { "x": 0, "w": 5 },
+    { "x": 7, "w": 6 }
+  ],
+  "kerning": [{ "left": "A", "right": "V", "adj": -2 }]
 }
 ```
 
-The build system converts this plus a PNG into the ZAF Font file.
-
 ---
 
-## 12. Backward/Forward Compatibility
+## 11. Producer Guidelines
 
-- Files with VERSION=1 conform to this spec.
-- Future versions must bump VERSION; readers should reject unknown versions unless they explicitly support them.
-- FLAGS are reserved for future use and must be zero in v1 files.
-
----
-
-## 13. Error Conditions (non-exhaustive)
-
-- magic_mismatch, bad_version, bad_flags
-- out_of_bounds (any section outside total_len)
-- duplicate_codepoint
-- codepoint_invalid (surrogate range)
-- glyph_outside_atlas (x + w > atlas.width)
-- inner_too_small (inner header < 21 bytes)
-- inner_eof (bitstream ends early)
-- inner_palette_idx_oob
-- inner_run_overflow
-
-Return a descriptive error and abort.
-
----
-
-## 14. Reference Decoder Footprint (indicative)
-
-- Outer container: parsing only.
-- Inner decoder state:
-- Palette: 16 bytes
-- Bit reader: a few bytes of accumulator
-- No floating point required.
-- RAM for output buffer width\*height bytes (could stream to display if supported).
+- **Charset mode only:** Per‑glyph codepoints are not serialized; define contiguous ranges that cover your glyph set.
+- **Advances:** Store per‑glyph `advance` (i8). If omitted in sidecar metadata, the builder uses `advance = w`.
+- **Kerning:** Optional. Include only meaningful pairs to save space.
+- **Atlas strip:** Pack glyphs left‑to‑right. A small gap (e.g., 2 px) between glyphs helps avoid sampling bleed.
+- **Integrity:** No checksum field; rely on `total_len` and robust decoder checks.
