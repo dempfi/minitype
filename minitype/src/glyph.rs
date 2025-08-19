@@ -1,11 +1,20 @@
+#![allow(dead_code)]
+
 use crate::{GlyphMeta, MiniTypeFont};
 
 /// Streaming iterator over a glyph's pixels (row-major).
-/// Produces `u8` alpha values (already palette-expanded) for exactly
-/// `glyph.w * font.atlas_height` pixels.
+/// Produces `u8` alpha values using a per-glyph fused LUT that combines:
+///   - the selected palette (nonlinear per-font fit), and
+///   - the bias/step hint (per-glyph dynamic).
+///
+/// Exact cost per pixel: one nibble extraction + one table lookup.
 pub struct GlyphIter<'a> {
   font: &'a MiniTypeFont<'a>,
   meta: GlyphMeta,
+
+  // Precomputed fused 16-entry alpha table for this glyph.
+  fused_lut: [u8; 16],
+
   // iteration state
   y: u16,
   remaining_in_row: u16,
@@ -19,9 +28,39 @@ pub struct GlyphIter<'a> {
 
 impl<'a> GlyphIter<'a> {
   pub(crate) fn new(font: &'a MiniTypeFont<'a>, meta: GlyphMeta) -> Self {
+    // bias in 0..240 (steps of 16); step from the 4-value table.
+    let bias = meta.bias16 * 16u16;
+    let step = [8u16, 12u16, 16u16, 24u16][meta.scale_idx];
+
+    // Build fused LUT: mix palette + bias/step, then enforce monotonicity.
+    let palette = &font.palettes()[meta.palette_id];
+    let mut lut = [0u8; 16];
+    lut[0] = 0;
+
+    // Weighted blend: favor bias/step (captures glyph-specific dynamic) but
+    // still respect palette curvature.  fused = round((3*p + 5*t)/8).
+    // This works well across light/dark glyphs without ringing.
+    let mut prev = 0u16;
+    let mut n = 1usize;
+    while n < 16 {
+      let p = palette[n] as u16;
+      let t_raw = bias + step.saturating_mul(n as u16);
+      let t = if t_raw > 255 { 255 } else { t_raw } as u16;
+
+      // fused = round((3*p + 5*t)/8)  ( +4 for rounding )
+      let fused = ((3 * p + 5 * t + 4) >> 3) as u16;
+
+      // Monotonic forward pass (cheap isotonic approximation).
+      let m = if fused < prev { prev } else { fused };
+      prev = m;
+      lut[n] = m as u8;
+      n += 1;
+    }
+
     GlyphIter {
       font,
       meta,
+      fused_lut: lut,
       y: 0,
       remaining_in_row: 0, // triggers row init on first `next()`
       payload_cursor: font.payload_off,
@@ -58,10 +97,14 @@ impl<'a> GlyphIter<'a> {
       self.row_byte_index = row_start + (x / 2);
       self.use_high = (x & 1) != 0; // odd x starts at the high nibble
       self.cur_byte = self.font.data[self.row_byte_index];
-    } else {
-      // Row has no payload; keep payload_cursor unchanged for this row.
     }
     true
+  }
+
+  #[inline]
+  fn expand_nibble(&self, n: u8) -> u8 {
+    // 0 stays 0 by construction of the LUT.
+    self.fused_lut[n as usize]
   }
 }
 
@@ -92,15 +135,16 @@ impl<'a> Iterator for GlyphIter<'a> {
       // Emit one pixel from the current row.
       if self.row_present {
         let b = self.cur_byte;
-        let idx = if self.use_high { (b >> 4) & 0x0F } else { b & 0x0F } as usize;
-        let alpha = self.font.palette[idx];
+        let nib = if self.use_high { (b >> 4) & 0x0F } else { b & 0x0F };
+
+        // Reconstruct alpha via fused LUT.
+        let alpha = self.expand_nibble(nib);
 
         // Update nibble state.
         if self.use_high {
           // consumed high nibble; move to next byte
           self.row_byte_index += 1;
-          // Guard against reading past the row. We only load next byte
-          // if more pixels remain in the row.
+          // Only load next byte if more pixels remain.
           if self.remaining_in_row > 1 {
             self.cur_byte = self.font.data[self.row_byte_index];
           }
@@ -113,7 +157,7 @@ impl<'a> Iterator for GlyphIter<'a> {
         self.remaining_in_row -= 1;
         return Some(alpha);
       } else {
-        // Whole row is black (palette[0]).
+        // Whole row is black.
         self.remaining_in_row -= 1;
         return Some(0);
       }

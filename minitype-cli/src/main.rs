@@ -1,12 +1,12 @@
-mod atlas;
 mod font;
+mod ttfgen;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Parser};
 use image::GenericImageView;
 use std::{fs, fs::File, io::Write, path::PathBuf};
 
-use crate::font::{Font, build_font_from_l8_and_meta, ttfgen};
+use crate::font::{Atlas, Metadata, assemble};
 
 // ---------------------------------------------
 // minitype: Font builder CLI
@@ -127,9 +127,11 @@ fn main() -> Result<()> {
     let png_bytes = fs::read(atlas_path).with_context(|| format!("read atlas {:?}", atlas_path))?;
     let json_text = fs::read_to_string(json_path).with_context(|| format!("read json {:?}", json_path))?;
 
-    let meta: Font = serde_json::from_str(&json_text)?;
+    let meta: Metadata = serde_json::from_str(&json_text)?;
     let (w, h, l8) = decode_png_to_l8(&png_bytes)?;
-    build_font_from_l8_and_meta(&l8, w, h, &meta).context("build MiniType container")?
+    let atlas = Atlas::new(w, h, l8)?;
+
+    assemble(meta, atlas)?
   };
 
   // Write output

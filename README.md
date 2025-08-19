@@ -37,7 +37,7 @@ minitype --ttf ./SF-Compact-Rounded-Medium.otf --size 13 -o ./assets/sf_13.mtf
 
 ```rs
 use minitype::{MiniTypeFont, MiniTextStyle};
-use embedded_canvas;
+use embedded_rgba::*;
 
 const SF_13: MiniTypeFont = MiniTypeFont::raw(include_bytes!("./assets/sf_13.mtf"));
 let text_style = MiniTextStyle::new(&SF_13, Rgb565::WHITE);
@@ -46,7 +46,3 @@ Text::with_alignment("Hello, world!", Point::new(10, 10), text_style, Alignment:
   .draw(&mut canvas.alpha())
   .unwrap();
 ```
-
-<div align="right"><sup>
-  made with ❤️ by <a href="https://github.com/dempfi">@dempfi</a>
-</sup></div>

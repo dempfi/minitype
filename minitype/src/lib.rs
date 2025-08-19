@@ -1,15 +1,14 @@
 #![no_std]
 
-//! Minimal no_std MiniType font reader & streaming glyph iterator.
+//! Minimal no_std MiniType font reader & streaming glyph iterator (multi-palette L4).
 //!
-//! Implements the spec provided in the project README. The reader takes a
-//! `&[u8]` and exposes:
-//! - Fast glyph metadata lookup by glyph index
-//! - Codepoint→glyph index mapping via compact charset segments
-//! - An O(1) setup, streaming `GlyphIter` that walks only the target glyph
-//!   rectangle across the atlas rows without decoding the whole atlas.
+//! File format (relevant parts):
+//! - Header "MFNT", version=1
+//! - Glyph table: 6 bytes/record → u16 x, u8 w, i8 advance, i8 left, u8 q
+//! - Atlas blob: u16 w, u16 h, [u8;64] palettes (4×16; each palette[0]==0),
+//!               rowmask[ceil(h/8)], rows (L4, 2px/byte)
 //!
-//! This module is `no_std`-friendly (uses only `core`).
+//! This module is `no_std` (uses only `core`).
 
 mod glyph;
 mod style;
@@ -23,7 +22,7 @@ pub use style::MiniTextStyle;
 pub enum Error {
   /// Wrong magic (expected "MFNT").
   BadMagic,
-  /// Unsupported version (expected 2).
+  /// Unsupported version (expected 1).
   BadVersion(u8),
   /// Header/glyph-table alignment/length errors.
   Malformed,
@@ -31,7 +30,7 @@ pub enum Error {
   LengthMismatch,
   /// Inner atlas header too short or inconsistent.
   AtlasHeader,
-  /// Atlas palette[0] must be 0x00.
+  /// Any atlas palette[k][0] must be 0x00.
   Palette0,
   /// Atlas payload shorter than required by row mask / width.
   AtlasTooShort,
@@ -43,13 +42,17 @@ pub enum Error {
   KerningBounds,
 }
 
-/// Compact glyph metadata (5 bytes/glyph in the file).
+/// Compact glyph metadata (6 bytes/glyph in the file).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GlyphMeta {
   pub x: u16,
   pub w: u8,
   pub advance: i8,
   pub left: i8,
+  /// Quantization/dequantization hints byte:
+  pub palette_id: usize,
+  pub scale_idx: usize,
+  pub bias16: u16,
 }
 
 /// Charset segment record (7 bytes each in the file).
@@ -95,10 +98,10 @@ pub struct MiniTypeFont<'a> {
   // Atlas inner header
   pub atlas_width: u16,
   pub atlas_height: u16,
-  palette: [u8; 16],
+  palettes: [[u8; 16]; 4], // 4 palettes
   row_mask_off: usize,
   row_mask_len: usize,     // == ceil(h/8)
-  payload_off: usize,      // == atlas_off + 20 + row_mask_len
+  payload_off: usize,      // == atlas_off + 68 + row_mask_len
   row_stride_bytes: usize, // == ceil(width/2)
 }
 
@@ -139,28 +142,35 @@ impl<'a> MiniTypeFont<'a> {
     if glyph_table_off != header_len {
       return Err(Error::Malformed);
     }
-    if glyph_table_len != 5usize * (glyph_count as usize) {
+    // 6 bytes per glyph now
+    if glyph_table_len != 6usize * (glyph_count as usize) {
       return Err(Error::Malformed);
     }
     if atlas_off != glyph_table_off + glyph_table_len {
       return Err(Error::Malformed);
     }
-    if atlas_off + 20 > total_len {
+    // Atlas inner header must have at least 68 bytes (w,h,4×16 palettes)
+    if atlas_off + 68 > total_len {
       return Err(Error::AtlasHeader);
     }
 
     // ---- Inner atlas header ----
     let width = le_u16_at(data, atlas_off);
     let height = le_u16_at(data, atlas_off + 2);
-    let palette_slice = &data[atlas_off + 4..atlas_off + 20];
-    let mut palette = [0u8; 16];
-    palette.copy_from_slice(palette_slice);
-    if palette[0] != 0 {
-      return Err(Error::Palette0);
+
+    // Read 4×16 palettes
+    let mut palettes = [[0u8; 16]; 4];
+    let mut p_off = atlas_off + 4;
+    for k in 0..4 {
+      palettes[k] = read_u8_16(data, p_off);
+      p_off += 16;
+      if palettes[k][0] != 0 {
+        return Err(Error::Palette0);
+      }
     }
 
     let row_mask_len = ceil_div_u16(height, 8) as usize;
-    let row_mask_off = atlas_off + 20;
+    let row_mask_off = atlas_off + 68;
     let payload_off = row_mask_off + row_mask_len;
     if payload_off > total_len {
       return Err(Error::AtlasHeader);
@@ -174,7 +184,7 @@ impl<'a> MiniTypeFont<'a> {
     }
     let present_rows = count_present_rows(&data[row_mask_off..row_mask_off + row_mask_len], height);
     let need_payload = present_rows as usize * row_stride_bytes;
-    if atlas_len < 20 + row_mask_len + need_payload {
+    if atlas_len < 68 + row_mask_len + need_payload {
       return Err(Error::AtlasTooShort);
     }
 
@@ -195,7 +205,7 @@ impl<'a> MiniTypeFont<'a> {
       kerning_off,
       atlas_width: width,
       atlas_height: height,
-      palette,
+      palettes,
       row_mask_off,
       row_mask_len,
       payload_off,
@@ -207,14 +217,7 @@ impl<'a> MiniTypeFont<'a> {
   ///
   /// # Safety
   /// Caller must guarantee that `data` points to a well-formed MiniType
-  /// font blob that adheres to the spec. No bounds or consistency checks
-  /// are performed; using malformed data may cause undefined behavior
-  /// or compile-time errors if evaluated in a `const` context.
-  /// e.g.
-  /// ```rust
-  /// # use minitype::MiniTypeFont;
-  /// # const SF_13: MiniTypeFont = MiniTypeFont::raw(include_bytes!("./assets/sf_13.mtfnt"));
-  /// ```
+  /// font blob that adheres to the spec.
   pub const fn raw(data: &'a [u8]) -> Self {
     let line_height = le_u16_at(data, 6);
     let ascent = le_i16_at(data, 8);
@@ -236,11 +239,19 @@ impl<'a> MiniTypeFont<'a> {
     // Inner atlas header (no validation)
     let width = le_u16_at(data, atlas_off);
     let height = le_u16_at(data, atlas_off + 2);
-    let p_base = atlas_off + 4;
-    let palette = read_u8_16(data, p_base);
+
+    // 4×16 palettes
+    let mut palettes = [[0u8; 16]; 4];
+    let mut p_off = atlas_off + 4;
+    let mut k = 0;
+    while k < 4 {
+      palettes[k] = read_u8_16(data, p_off);
+      p_off += 16;
+      k += 1;
+    }
 
     // Row mask / payload geometry (no validation)
-    let row_mask_off = atlas_off + 20;
+    let row_mask_off = atlas_off + 68;
     let row_mask_len = ceil_div_u16(height, 8) as usize;
     let payload_off = row_mask_off + row_mask_len;
     let row_stride_bytes = ceil_div_u16(width, 2) as usize;
@@ -262,7 +273,7 @@ impl<'a> MiniTypeFont<'a> {
       kerning_off,
       atlas_width: width,
       atlas_height: height,
-      palette,
+      palettes,
       row_mask_off,
       row_mask_len,
       payload_off,
@@ -270,21 +281,25 @@ impl<'a> MiniTypeFont<'a> {
     }
   }
 
-  /// Fetch glyph metadata by glyph index.
+  /// Fetch glyph metadata by glyph index (6 bytes/record).
   #[inline]
   pub fn glyph_meta(&self, index: u16) -> Option<GlyphMeta> {
     if index as usize >= self.glyph_count as usize {
       return None;
     }
-    let off = self.glyph_table_off + (index as usize) * 5;
-    if off + 5 > self.data.len() {
+    let off = self.glyph_table_off + (index as usize) * 6;
+    if off + 6 > self.data.len() {
       return None;
     }
     let x = le_u16_at(&self.data, off);
     let w = self.data[off + 2];
     let advance = self.data[off + 3] as i8;
     let left = self.data[off + 4] as i8;
-    Some(GlyphMeta { x, w, advance, left })
+    let q = self.data[off + 5];
+    let palette_id = (q & 0b11) as usize;
+    let scale_idx = ((q >> 2) & 0b11) as usize;
+    let bias16 = ((q >> 4) & 0x0F) as u16;
+    Some(GlyphMeta { x, w, advance, left, palette_id, scale_idx, bias16 })
   }
 
   /// Map Unicode scalar value to glyph index using charset segments.
@@ -343,6 +358,11 @@ impl<'a> MiniTypeFont<'a> {
   pub fn glyph_iter_for_cp(&'a self, cp: u32) -> Option<GlyphIter<'a>> {
     let idx = self.glyph_index_for_cp(cp)?;
     self.glyph_iter_for_index(idx)
+  }
+
+  #[inline]
+  pub fn palettes(&self) -> &[[u8; 16]; 4] {
+    &self.palettes
   }
 
   #[inline]
