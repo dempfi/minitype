@@ -11,15 +11,19 @@
 //!
 //! This module is `no_std`-friendly (uses only `core`).
 
-use core::convert::TryInto;
+mod glyph;
+mod style;
+use glyph::GlyphIter;
+
+pub use style::MiniTextStyle;
 
 /// Parsing/validation errors
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error {
-  /// Wrong magic (expected "ZFNT").
+  /// Wrong magic (expected "MFNT").
   BadMagic,
-  /// Unsupported version (expected 1).
+  /// Unsupported version (expected 2).
   BadVersion(u8),
   /// Header/glyph-table alignment/length errors.
   Malformed,
@@ -39,12 +43,13 @@ pub enum Error {
   KerningBounds,
 }
 
-/// Compact glyph metadata (4 bytes/glyph in the file).
+/// Compact glyph metadata (5 bytes/glyph in the file).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GlyphMeta {
   pub x: u16,
   pub w: u8,
   pub advance: i8,
+  pub left: i8,
 }
 
 /// Charset segment record (7 bytes each in the file).
@@ -74,7 +79,7 @@ pub struct MiniTypeFont<'a> {
   pub descent: i16,
 
   // Counts
-  glyph_count: u16,
+  pub glyph_count: u16,
   charset_seg_count: u16,
   kerning_count: u32,
 
@@ -112,18 +117,18 @@ impl<'a> MiniTypeFont<'a> {
       return Err(Error::BadVersion(version));
     }
     let _flags = data[5];
-    let line_height = le_u16(&data[6..8]);
-    let ascent = le_i16(&data[8..10]);
-    let descent = le_i16(&data[10..12]);
-    let glyph_count = le_u16(&data[12..14]);
-    let glyph_table_off = le_u32(&data[14..18]) as usize;
-    let glyph_table_len = le_u32(&data[18..22]) as usize;
-    let atlas_off = le_u32(&data[22..26]) as usize;
-    let atlas_len = le_u32(&data[26..30]) as usize;
-    let total_len = le_u32(&data[30..34]) as usize;
-    let kerning_off = le_u32(&data[34..38]) as usize;
-    let kerning_count = le_u32(&data[38..42]);
-    let charset_seg_count = le_u16(&data[42..44]);
+    let line_height = le_u16_at(data, 6);
+    let ascent = le_i16_at(data, 8);
+    let descent = le_i16_at(data, 10);
+    let glyph_count = le_u16_at(data, 12);
+    let glyph_table_off = le_u32_at(data, 14) as usize;
+    let glyph_table_len = le_u32_at(data, 18) as usize;
+    let atlas_off = le_u32_at(data, 22) as usize;
+    let atlas_len = le_u32_at(data, 26) as usize;
+    let total_len = le_u32_at(data, 30) as usize;
+    let kerning_off = le_u32_at(data, 34) as usize;
+    let kerning_count = le_u32_at(data, 38);
+    let charset_seg_count = le_u16_at(data, 42);
 
     if total_len != data.len() {
       return Err(Error::LengthMismatch);
@@ -134,7 +139,7 @@ impl<'a> MiniTypeFont<'a> {
     if glyph_table_off != header_len {
       return Err(Error::Malformed);
     }
-    if glyph_table_len != 4usize * (glyph_count as usize) {
+    if glyph_table_len != 5usize * (glyph_count as usize) {
       return Err(Error::Malformed);
     }
     if atlas_off != glyph_table_off + glyph_table_len {
@@ -145,8 +150,8 @@ impl<'a> MiniTypeFont<'a> {
     }
 
     // ---- Inner atlas header ----
-    let width = le_u16(&data[atlas_off..atlas_off + 2]);
-    let height = le_u16(&data[atlas_off + 2..atlas_off + 4]);
+    let width = le_u16_at(data, atlas_off);
+    let height = le_u16_at(data, atlas_off + 2);
     let palette_slice = &data[atlas_off + 4..atlas_off + 20];
     let mut palette = [0u8; 16];
     palette.copy_from_slice(palette_slice);
@@ -171,30 +176,6 @@ impl<'a> MiniTypeFont<'a> {
     let need_payload = present_rows as usize * row_stride_bytes;
     if atlas_len < 20 + row_mask_len + need_payload {
       return Err(Error::AtlasTooShort);
-    }
-
-    // Validate kerning block bounds if present.
-    if kerning_off != 0 {
-      let need = kerning_off + 7usize * (kerning_count as usize);
-      if need > total_len || kerning_off < atlas_off + atlas_len {
-        return Err(Error::KerningBounds);
-      }
-    }
-
-    // Validate glyph table within file.
-    if glyph_table_off + glyph_table_len > total_len {
-      return Err(Error::Malformed);
-    }
-
-    // Validate each glyph fits within atlas width.
-    for gi in 0..(glyph_count as usize) {
-      let off = glyph_table_off + gi * 4;
-      let x = le_u16(&data[off..off + 2]);
-      let w = data[off + 2];
-      let xw = x as u32 + w as u32;
-      if xw > width as u32 {
-        return Err(Error::GlyphBounds);
-      }
     }
 
     Ok(Self {
@@ -222,10 +203,71 @@ impl<'a> MiniTypeFont<'a> {
     })
   }
 
-  /// Number of glyphs.
-  #[inline]
-  pub fn glyph_count(&self) -> u16 {
-    self.glyph_count
+  /// Construct a `MiniTypeFont` view **without validation**.
+  ///
+  /// # Safety
+  /// Caller must guarantee that `data` points to a well-formed MiniType
+  /// font blob that adheres to the spec. No bounds or consistency checks
+  /// are performed; using malformed data may cause undefined behavior
+  /// or compile-time errors if evaluated in a `const` context.
+  /// e.g.
+  /// ```rust
+  /// # use minitype::MiniTypeFont;
+  /// # const SF_13: MiniTypeFont = MiniTypeFont::raw(include_bytes!("./assets/sf_13.mtfnt"));
+  /// ```
+  pub const fn raw(data: &'a [u8]) -> Self {
+    let line_height = le_u16_at(data, 6);
+    let ascent = le_i16_at(data, 8);
+    let descent = le_i16_at(data, 10);
+    let glyph_count = le_u16_at(data, 12);
+    let glyph_table_off = le_u32_at(data, 14) as usize;
+    let glyph_table_len = le_u32_at(data, 18) as usize;
+    let atlas_off = le_u32_at(data, 22) as usize;
+    let atlas_len = le_u32_at(data, 26) as usize;
+    let _total_len = le_u32_at(data, 30) as usize;
+    let kerning_off = le_u32_at(data, 34) as usize;
+    let kerning_count = le_u32_at(data, 38);
+    let charset_seg_count = le_u16_at(data, 42);
+
+    // Derived header layout values
+    let charset_segs_off = 0x2C;
+    let header_len = 0x2C + 7usize * (charset_seg_count as usize);
+
+    // Inner atlas header (no validation)
+    let width = le_u16_at(data, atlas_off);
+    let height = le_u16_at(data, atlas_off + 2);
+    let p_base = atlas_off + 4;
+    let palette = read_u8_16(data, p_base);
+
+    // Row mask / payload geometry (no validation)
+    let row_mask_off = atlas_off + 20;
+    let row_mask_len = ceil_div_u16(height, 8) as usize;
+    let payload_off = row_mask_off + row_mask_len;
+    let row_stride_bytes = ceil_div_u16(width, 2) as usize;
+
+    Self {
+      data,
+      line_height,
+      ascent,
+      descent,
+      glyph_count,
+      charset_seg_count,
+      kerning_count,
+      header_len,
+      glyph_table_off,
+      glyph_table_len,
+      charset_segs_off,
+      atlas_off,
+      atlas_len,
+      kerning_off,
+      atlas_width: width,
+      atlas_height: height,
+      palette,
+      row_mask_off,
+      row_mask_len,
+      payload_off,
+      row_stride_bytes,
+    }
   }
 
   /// Fetch glyph metadata by glyph index.
@@ -234,14 +276,15 @@ impl<'a> MiniTypeFont<'a> {
     if index as usize >= self.glyph_count as usize {
       return None;
     }
-    let off = self.glyph_table_off + (index as usize) * 4;
-    if off + 4 > self.data.len() {
+    let off = self.glyph_table_off + (index as usize) * 5;
+    if off + 5 > self.data.len() {
       return None;
     }
-    let x = le_u16(&self.data[off..off + 2]);
+    let x = le_u16_at(&self.data, off);
     let w = self.data[off + 2];
     let advance = self.data[off + 3] as i8;
-    Some(GlyphMeta { x, w, advance })
+    let left = self.data[off + 4] as i8;
+    Some(GlyphMeta { x, w, advance, left })
   }
 
   /// Map Unicode scalar value to glyph index using charset segments.
@@ -252,9 +295,9 @@ impl<'a> MiniTypeFont<'a> {
       if off + 7 > self.data.len() {
         return None;
       }
-      let start = le_u24(&self.data[off..off + 3]);
-      let len = le_u16(&self.data[off + 3..off + 5]);
-      let base = le_u16(&self.data[off + 5..off + 7]);
+      let start = le_u24_at(&self.data, off);
+      let len = le_u16_at(&self.data, off + 3);
+      let base = le_u16_at(&self.data, off + 5);
       off += 7;
 
       if cp >= start && cp < start + len as u32 {
@@ -279,8 +322,8 @@ impl<'a> MiniTypeFont<'a> {
       if off + 7 > self.data.len() {
         break;
       }
-      let l = le_u24(&self.data[off..off + 3]);
-      let r = le_u24(&self.data[off + 3..off + 6]);
+      let l = le_u24_at(&self.data, off);
+      let r = le_u24_at(&self.data, off + 3);
       let adj = self.data[off + 6] as i8;
       off += 7;
       if l == left_cp && r == right_cp {
@@ -314,152 +357,40 @@ impl<'a> MiniTypeFont<'a> {
   }
 }
 
-/// Streaming iterator over a glyph's pixels (row-major).
-/// Produces `u8` alpha values (already palette-expanded) for exactly
-/// `glyph.w * font.atlas_height` pixels.
-pub struct GlyphIter<'a> {
-  font: &'a MiniTypeFont<'a>,
-  meta: GlyphMeta,
-  // iteration state
-  y: u16,
-  remaining_in_row: u16,
-  payload_cursor: usize, // global cursor across present rows
-  // per-row decoding state (valid only while remaining_in_row > 0)
-  row_present: bool,
-  row_byte_index: usize, // row start + (x/2)
-  use_high: bool,        // if true -> use high nibble of current byte
-  cur_byte: u8,
-}
-
-impl<'a> GlyphIter<'a> {
-  fn new(font: &'a MiniTypeFont<'a>, meta: GlyphMeta) -> Self {
-    GlyphIter {
-      font,
-      meta,
-      y: 0,
-      remaining_in_row: 0, // triggers row init on first `next()`
-      payload_cursor: font.payload_off,
-      row_present: false,
-      row_byte_index: 0,
-      use_high: false,
-      cur_byte: 0,
-    }
-  }
-
-  #[inline]
-  pub fn width(&self) -> u16 {
-    self.meta.w as u16
-  }
-
-  #[inline]
-  pub fn height(&self) -> u16 {
-    self.font.atlas_height
-  }
-
-  // Initialize state for the next row (if any).
-  fn begin_row(&mut self) -> bool {
-    if self.y >= self.font.atlas_height {
-      return false;
-    }
-    self.row_present = self.font.row_present(self.y);
-    self.remaining_in_row = self.meta.w as u16;
-
-    if self.row_present {
-      // Compute row start in payload (current payload_cursor), then
-      // position at the glyph's x offset.
-      let row_start = self.payload_cursor;
-      let x = self.meta.x as usize;
-      self.row_byte_index = row_start + (x / 2);
-      self.use_high = (x & 1) != 0; // odd x starts at the high nibble
-      self.cur_byte = self.font.data[self.row_byte_index];
-    } else {
-      // Row has no payload; keep payload_cursor unchanged for this row.
-    }
-    true
-  }
-}
-
-impl<'a> Iterator for GlyphIter<'a> {
-  type Item = u8; // alpha
-
-  fn next(&mut self) -> Option<Self::Item> {
-    loop {
-      // Start a new row if needed.
-      if self.remaining_in_row == 0 {
-        if self.y >= self.font.atlas_height {
-          return None;
-        }
-        // If we just finished a present row, advance payload_cursor by stride.
-        if self.y > 0 {
-          let prev_y = self.y - 1;
-          if self.font.row_present(prev_y) {
-            self.payload_cursor += self.font.row_stride_bytes;
-          }
-        }
-        // Begin current row
-        if !self.begin_row() {
-          return None;
-        }
-        self.y += 1; // mark that row is active (y counts rows consumed)
-      }
-
-      // Emit one pixel from the current row.
-      if self.row_present {
-        let b = self.cur_byte;
-        let idx = if self.use_high { (b >> 4) & 0x0F } else { b & 0x0F } as usize;
-        let alpha = self.font.palette[idx];
-
-        // Update nibble state.
-        if self.use_high {
-          // consumed high nibble; move to next byte
-          self.row_byte_index += 1;
-          // Guard against reading past the row. We only load next byte
-          // if more pixels remain in the row.
-          if self.remaining_in_row > 1 {
-            self.cur_byte = self.font.data[self.row_byte_index];
-          }
-          self.use_high = false;
-        } else {
-          // consumed low nibble; next is high of the same byte
-          self.use_high = true;
-        }
-
-        self.remaining_in_row -= 1;
-        return Some(alpha);
-      } else {
-        // Whole row is black (palette[0]).
-        self.remaining_in_row -= 1;
-        return Some(self.font.palette[0]);
-      }
-    }
-  }
-}
-
-// ---------- helpers ----------
-
 #[inline]
-fn le_u16(b: &[u8]) -> u16 {
-  u16::from_le_bytes(b[0..2].try_into().unwrap())
-}
-
-#[inline]
-fn le_i16(b: &[u8]) -> i16 {
-  i16::from_le_bytes(b[0..2].try_into().unwrap())
-}
-
-#[inline]
-fn le_u24(b: &[u8]) -> u32 {
-  (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16)
-}
-
-#[inline]
-fn le_u32(b: &[u8]) -> u32 {
-  u32::from_le_bytes(b[0..4].try_into().unwrap())
-}
-
-#[inline]
-fn ceil_div_u16(v: u16, d: u16) -> u16 {
+pub const fn ceil_div_u16(v: u16, d: u16) -> u16 {
   (v + (d - 1)) / d
+}
+
+#[inline]
+pub const fn le_u16_at(b: &[u8], off: usize) -> u16 {
+  (b[off] as u16) | ((b[off + 1] as u16) << 8)
+}
+
+#[inline]
+pub const fn le_i16_at(b: &[u8], off: usize) -> i16 {
+  i16::from_le_bytes([b[off], b[off + 1]])
+}
+
+#[inline]
+pub const fn le_u24_at(b: &[u8], off: usize) -> u32 {
+  (b[off] as u32) | ((b[off + 1] as u32) << 8) | ((b[off + 2] as u32) << 16)
+}
+
+#[inline]
+pub const fn le_u32_at(b: &[u8], off: usize) -> u32 {
+  (b[off] as u32) | ((b[off + 1] as u32) << 8) | ((b[off + 2] as u32) << 16) | ((b[off + 3] as u32) << 24)
+}
+
+#[inline]
+pub const fn read_u8_16(b: &[u8], off: usize) -> [u8; 16] {
+  let mut out = [0u8; 16];
+  let mut i = 0;
+  while i < 16 {
+    out[i] = b[off + i];
+    i += 1;
+  }
+  out
 }
 
 fn count_present_rows(mask: &[u8], height: u16) -> u16 {

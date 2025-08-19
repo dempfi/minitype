@@ -3,7 +3,7 @@
 //! This module implements a compact, MCU-friendly grayscale atlas format for 8-bit L8 images using a 16-color palette, 4bpp packed indices, and row skipping.
 //!
 //! ## Format Summary
-//! - **Palette**: 16 bytes. `palette[0]` is always 0x00 (black), `palette[15]` is 0xFF (white). The remaining 14 entries are computed by a Lloyd–Max (1‑D k‑means) optimizer in **linear light** and then converted back to sRGB. If the image uses ≤15 distinct nonzero values, those exact values are preserved instead of optimizing.
+//! - **Palette**: 16 bytes. `palette[0]` is always 0x00 (black), `palette[15]` is 0xFF (white). The remaining 14 entries form a **monotonic, evenly spaced ramp in linear light** (perceptual) and are converted back to sRGB. If the image uses ≤15 distinct nonzero values, those exact values are preserved instead of optimizing.
 //! - **Indices**: Each pixel is mapped to the nearest palette entry **in linear light** (ties resolved by lower index).
 //! - **Packing**: Pixels stored as 4bpp indices, 2 per byte. Low nibble = left pixel, high nibble = right pixel. For odd width, final byte’s high nibble is 0 and must be ignored.
 //! - **Row Mask**: A bitset of ceil(height/8) bytes, LSB-first. Bit y=1 → row data present; y=0 → row omitted (implicitly black, index 0).
@@ -16,6 +16,8 @@
 //!
 //! ## Encoding/Decoding
 //! - **Encoding**: Build the palette, map each pixel to a palette index, construct the row mask, and emit the header followed by packed row payloads.
+//!   Linearize (γ≈2.2) → map to the ramp by nearest level in **linear light**; optionally apply low-strength, edge‑aware error diffusion (Floyd–Steinberg) to hide banding.
+//!   Use `compress_with_opts(..., opts)` to tune dithering/edge threshold.
 //! - **Decoding**: Parse the header, palette, and row mask; for each row, if mask=0, fill row with palette[0], else read packed indices and expand to palette values.
 //!
 //! ## MCU Considerations
@@ -32,36 +34,137 @@
 //! assert_eq!((dw, dh), (w, h));
 //! assert_eq!(out, img);
 //! ```
-pub fn compress(pixels: &[u8], w: u16, h: u16) -> Vec<u8> {
+/// Options controlling quantization and dithering.
+#[derive(Copy, Clone, Debug)]
+pub struct QuantOptions {
+  /// Enable edge-aware Floyd–Steinberg dithering (applied only near edges).
+  pub dither: bool,
+  /// Edge detection threshold in sRGB (0..=255). Larger = fewer pixels considered edges.
+  pub edge_thresh: u8,
+}
+
+/// Sensible defaults: dithering on, moderate edge threshold.
+pub const DEFAULT_OPTS: QuantOptions = QuantOptions { dither: true, edge_thresh: 12 };
+
+pub fn compress_with_opts(pixels: &[u8], w: u16, h: u16, opts: QuantOptions) -> Vec<u8> {
   let (palette, map_idx) = build_palette_u8(pixels);
   let w_usize = w as usize;
   let h_usize = h as usize;
   let rowmask_len = (h_usize + 7) / 8;
+
+  // Optional edge-aware Floyd–Steinberg dithering (linear light).
+  let dither = opts.dither;
+  let edge_thresh: u8 = opts.edge_thresh; // apply diffusion only near visible edges
+  let mut err_curr = vec![0f32; w_usize];
+  let mut err_next = vec![0f32; w_usize];
+  let centers_lin = palette_centers_linear(&palette);
+
   let mut rowmask = vec![0u8; rowmask_len];
   let mut rows_data: Vec<Vec<u8>> = Vec::with_capacity(h_usize);
 
   for row in 0..h_usize {
+    // Reset next-row errors at the start of each row
+    err_next.fill(0.0);
+
     let row_start = row * w_usize;
     let mut has_nonzero = false;
     let mut indices = Vec::with_capacity((w_usize + 1) / 2);
     let mut i = 0;
     while i < w_usize {
-      let idx_l = map_idx[pixels[row_start + i] as usize];
-      if idx_l != 0 {
+      // --- Left pixel ---
+      let x0 = i;
+      let s0 = pixels[row_start + x0];
+      // Edge detection: compare to left/up neighbors in sRGB space
+      let mut edge0 = false;
+      if x0 > 0 {
+        edge0 |= s0.abs_diff(pixels[row_start + x0 - 1]) >= edge_thresh;
+      }
+      if row > 0 {
+        edge0 |= s0.abs_diff(pixels[row_start - w_usize + x0]) >= edge_thresh;
+      }
+      // Linearize + add error (if dithering)
+      let mut v0 = to_lin(s0);
+      if dither && edge0 {
+        v0 = (v0 + err_curr[x0]).clamp(0.0, 1.0);
+      }
+      // Quantize by nearest center in linear light
+      let mut idx_l = 0u8;
+      let mut bd = f32::INFINITY;
+      for c in 0..16 {
+        let d = (v0 - centers_lin[c]).abs();
+        if d < bd {
+          bd = d;
+          idx_l = c as u8;
+        }
+      }
+      if dither && edge0 {
+        let q0 = centers_lin[idx_l as usize];
+        let e = v0 - q0;
+        // Distribute FS errors (7/16, 3/16, 5/16, 1/16)
+        if x0 + 1 < w_usize {
+          err_curr[x0 + 1] += e * (7.0 / 16.0);
+        }
+        if x0 > 0 {
+          err_next[x0 - 1] += e * (3.0 / 16.0);
+        }
+        err_next[x0] += e * (5.0 / 16.0);
+        if x0 + 1 < w_usize {
+          err_next[x0 + 1] += e * (1.0 / 16.0);
+        }
+      }
+
+      // --- Right pixel (if any) ---
+      let mut idx_r = 0u8;
+      if x0 + 1 < w_usize {
+        let x1 = x0 + 1;
+        let s1 = pixels[row_start + x1];
+        let mut edge1 = false;
+        edge1 |= s1.abs_diff(pixels[row_start + x0]) >= edge_thresh;
+        if row > 0 {
+          edge1 |= s1.abs_diff(pixels[row_start - w_usize + x1]) >= edge_thresh;
+        }
+        let mut v1 = to_lin(s1);
+        if dither && edge1 {
+          v1 = (v1 + err_curr[x1]).clamp(0.0, 1.0);
+        }
+        let mut best_i = 0u8;
+        let mut bd1 = f32::INFINITY;
+        for c in 0..16 {
+          let d = (v1 - centers_lin[c]).abs();
+          if d < bd1 {
+            bd1 = d;
+            best_i = c as u8;
+          }
+        }
+        idx_r = best_i;
+        if dither && edge1 {
+          let q1 = centers_lin[idx_r as usize];
+          let e = v1 - q1;
+          if x1 + 1 < w_usize {
+            err_curr[x1 + 1] += e * (7.0 / 16.0);
+          }
+          if x1 > 0 {
+            err_next[x1 - 1] += e * (3.0 / 16.0);
+          }
+          err_next[x1] += e * (5.0 / 16.0);
+          if x1 + 1 < w_usize {
+            err_next[x1 + 1] += e * (1.0 / 16.0);
+          }
+        }
+      } else {
+        idx_r = 0;
+      }
+
+      if idx_l != 0 || idx_r != 0 {
         has_nonzero = true;
       }
-      let idx_r = if i + 1 < w_usize {
-        let idx = map_idx[pixels[row_start + i + 1] as usize];
-        if idx != 0 {
-          has_nonzero = true;
-        }
-        idx
-      } else {
-        0u8
-      };
       let packed = (idx_r << 4) | (idx_l & 0x0F);
       indices.push(packed);
       i += 2;
+    }
+
+    if dither {
+      std::mem::swap(&mut err_curr, &mut err_next);
     }
 
     if has_nonzero {
@@ -89,6 +192,11 @@ pub fn compress(pixels: &[u8], w: u16, h: u16) -> Vec<u8> {
   }
 
   out
+}
+
+/// Backward-compatible entrypoint using DEFAULT_OPTS.
+pub fn compress(pixels: &[u8], w: u16, h: u16) -> Vec<u8> {
+  compress_with_opts(pixels, w, h, DEFAULT_OPTS)
 }
 
 /// Decompress a simple L4+palette bytestream with row skipping into `(width, height, L8 pixels)`.
@@ -157,19 +265,14 @@ pub fn decompress(data: &[u8]) -> Result<(u16, u16, Vec<u8>), anyhow::Error> {
   Ok((w, h, out))
 }
 
-/// Build a 16-entry u8 palette for the new format and a 256-entry map from value -> nearest palette index.
+/// Build a 16-entry u8 palette as a **monotonic ramp in linear light** and a 256-entry
+/// map from value -> nearest palette index (nearest measured in linear light).
 ///
-/// - Computes a 256-bin histogram.
-/// - palette[0] = 0.
-/// - palette[15] = 255.
-/// - palette[1..15]: 14 entries computed by Lloyd–Max clustering in linear light or preserved exact values if ≤15 distinct nonzero.
-/// - Returns a palette and a value->nearest-index LUT (ties by lower index).
+/// Fast path: if there are ≤15 distinct nonzero values in the image, preserve them exactly.
 pub fn build_palette_u8(pixels: &[u8]) -> ([u8; 16], [u8; 256]) {
   // Histogram & unique set
-  let mut hist = [0usize; 256];
   let mut used = [false; 256];
   for &v in pixels {
-    hist[v as usize] += 1;
     used[v as usize] = true;
   }
 
@@ -182,20 +285,17 @@ pub fn build_palette_u8(pixels: &[u8]) -> ([u8; 16], [u8; 256]) {
     for (i, &v) in uniques.iter().take(15).enumerate() {
       palette[i + 1] = v;
     }
-    // Build nearest-index map by sRGB distance (exact matches will map back 1:1)
+    // Build nearest-index map by linear-light distance (ties -> lower index)
+    let centers = palette_centers_linear(&palette);
     let mut map_idx = [0u8; 256];
-    for v in 0u16..=255 {
-      // ties -> lower index
+    for v in 0..=255 {
+      let lv = to_lin(v as u8);
       let mut best_i = 0u8;
-      let mut best_d = u16::MAX;
-      for (i, &p) in palette.iter().enumerate() {
-        let d = if v as i32 >= p as i32 {
-          v as i32 - p as i32
-        } else {
-          p as i32 - v as i32
-        } as u16;
-        if d < best_d || (d == best_d && (i as u8) < best_i) {
-          best_d = d;
+      let mut bd = f32::INFINITY;
+      for i in 0..16 {
+        let d = (lv - centers[i]).abs();
+        if d < bd || (d == bd && (i as u8) < best_i) {
+          bd = d;
           best_i = i as u8;
         }
       }
@@ -204,95 +304,31 @@ pub fn build_palette_u8(pixels: &[u8]) -> ([u8; 16], [u8; 256]) {
     return (palette, map_idx);
   }
 
-  // Lloyd–Max in linear light for 16 levels with 0 and 255 pinned
-  const GAMMA: f32 = 2.2;
-  #[inline]
-  fn to_lin(v: u8) -> f32 {
-    ((v as f32) / 255.0).powf(GAMMA)
-  }
-
-  #[inline]
-  fn to_srgb(l: f32) -> u8 {
-    (255.0 * l.clamp(0.0, 1.0).powf(1.0 / GAMMA)).round() as u8
-  }
-
-  // Precompute linear positions and weights per bin
-  let mut lin = [0f32; 256];
-  for v in 0..=255 {
-    lin[v] = to_lin(v as u8);
-  }
-
-  // Initialize centers uniformly in linear space (with pins at 0 and 1)
-  let k = 16usize; // total
-  let free = 14usize; // free centers between 0 and 1
+  // Monotonic, evenly spaced ramp in linear light (perceptual), pinned at 0 and 1.
   let mut centers = [0f32; 16];
   centers[0] = 0.0;
   centers[15] = 1.0;
-  for i in 0..free {
-    centers[i + 1] = (i as f32 + 1.0) / (free as f32 + 1.0);
+  for i in 1..15 {
+    centers[i] = (i as f32) / 15.0;
   }
-
-  // Lloyd–Max iterations
-  for _ in 0..16 {
-    // Assign each bin to nearest center (linear distance)
-    let mut sum = [0f64; 16];
-    let mut wsum = [0u64; 16];
-    for v in 0..=255 {
-      let w = hist[v] as u64;
-      if w == 0 {
-        continue;
-      }
-      // evaluate distances to all centers; 16 small, fine
-      let lv = lin[v];
-      let mut best = 0usize;
-      let mut bd = f32::INFINITY;
-      for i in 0..k {
-        let d = (lv - centers[i]).abs();
-        if d < bd {
-          bd = d;
-          best = i;
-        }
-      }
-      sum[best] += (lv as f64) * (w as f64);
-      wsum[best] += w;
-    }
-    // Recompute free centers as weighted means; keep 0 & 1 pinned
-    for i in 1..15 {
-      if wsum[i] > 0 {
-        centers[i] = (sum[i] / wsum[i] as f64) as f32;
-      }
-    }
-    // Enforce monotonicity
-    for i in 1..15 {
-      if centers[i] < centers[i - 1] {
-        centers[i] = centers[i - 1];
-      }
-    }
-    for i in (1..15).rev() {
-      if centers[i] > centers[i + 1] {
-        centers[i] = centers[i + 1];
-      }
-    }
-  }
-
-  // Convert centers to sRGB palette and enforce a minimum separation in sRGB
+  // Convert to sRGB palette with minimal separation to keep strict monotonicity in byte space.
   let mut palette = [0u8; 16];
   for i in 0..16 {
     palette[i] = to_srgb(centers[i]);
   }
   palette[0] = 0;
   palette[15] = 255;
-  // Minimum separation of 4 in sRGB
+  // Enforce a small minimum separation (>=4) in sRGB to avoid accidental reversals after rounding.
   for i in 1..16 {
-    if palette[i] < palette[i - 1].saturating_add(4) {
-      palette[i] = palette[i - 1].saturating_add(4).min(255);
+    let min_next = palette[i - 1].saturating_add(4).min(255);
+    if palette[i] < min_next {
+      palette[i] = min_next;
     }
   }
-
   // Build nearest-index map by **linear** distance
   let mut map_idx = [0u8; 256];
   for v in 0..=255 {
-    let lv = lin[v];
+    let lv = to_lin(v as u8);
     let mut best_i = 0u8;
     let mut bd = f32::INFINITY;
     for i in 0..16 {
@@ -305,6 +341,24 @@ pub fn build_palette_u8(pixels: &[u8]) -> ([u8; 16], [u8; 256]) {
     map_idx[v] = best_i;
   }
   (palette, map_idx)
+}
+
+const GAMMA: f32 = 2.2;
+#[inline]
+fn to_lin(v: u8) -> f32 {
+  ((v as f32) / 255.0).powf(GAMMA)
+}
+#[inline]
+fn to_srgb(l: f32) -> u8 {
+  (255.0 * l.clamp(0.0, 1.0).powf(1.0 / GAMMA)).round() as u8
+}
+#[inline]
+fn palette_centers_linear(palette: &[u8; 16]) -> [f32; 16] {
+  let mut c = [0.0f32; 16];
+  for i in 0..16 {
+    c[i] = to_lin(palette[i]);
+  }
+  c
 }
 
 #[cfg(test)]

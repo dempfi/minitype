@@ -18,7 +18,7 @@
 /// 0x0A 2  descent (i16)
 /// 0x0C 2  glyph_count (u16)
 /// 0x0E 4  glyph_table_offset (u32)
-/// 0x12 4  glyph_table_len    (u32)   // bytes; each record is 4 bytes: u16 x, u8 w, i8 advance
+/// 0x12 4  glyph_table_len    (u32)   // bytes; each record is 5 bytes: u16 x, u8 w, i8 advance, i8 left
 /// 0x16 4  atlas_offset       (u32)
 /// 0x1A 4  atlas_len          (u32)   // bytes; see atlas header below
 /// 0x1E 4  total_len          (u32)
@@ -26,7 +26,7 @@
 /// 0x26 4  kerning_count      (u32)   // number of pairs; each is 7 bytes (u24 left, u24 right, i8 adj)
 /// 0x2A 2  charset_seg_count  (u16)
 /// 0x2C .. charset_segments[charset_seg_count]  // each 7 bytes: u24 start, u16 len, u16 base
-/// ...   .. glyph_table                        // 4 bytes per glyph: u16 x, u8 w, i8 advance
+/// ...   .. glyph_table                        // 5 bytes per glyph: u16 x, u8 w, i8 advance, i8 left
 /// ...   .. atlas_blob
 /// ...   .. kerning_pairs[kerning_count]       // optional, after atlas blob
 /// ```
@@ -57,7 +57,7 @@ fn push_u24_le(buf: &mut Vec<u8>, v: u32) {
 ///   "ascent": 12,
 ///   "descent": -4,
 ///   "charset": [{"start":" ", "end":"~"}],
-///   "glyphs": [ {"x":0, "w":5}, {"x":5, "w":6} ],
+///   "glyphs": [ {"x":0, "w":5, "left":0}, {"x":5, "w":6, "left":-1} ],
 ///   "kerning": [{"left":"A","right":"V","adj":-2}]
 /// }
 /// ```
@@ -80,12 +80,18 @@ pub struct Glyph {
   pub w: u8,
   #[serde(default)]
   pub advance: Option<i8>,
+  #[serde(default)]
+  pub left: Option<i8>,
 }
 
 impl Glyph {
   #[inline]
   fn resolved_advance(&self) -> i8 {
     self.advance.unwrap_or(self.w as i8)
+  }
+  #[inline]
+  fn resolved_left(&self) -> i8 {
+    self.left.unwrap_or(0)
   }
 }
 
@@ -159,9 +165,9 @@ pub fn build_font_from_l8_and_meta(l8: &[u8], width: u16, height: u16, meta: &Fo
     return Err(anyhow::anyhow!("charset is required"));
   }
 
-  let mut glyphs_info: Vec<(u16, u8, i8)> = Vec::with_capacity(meta.glyphs.len());
+  let mut glyphs_info: Vec<(u16, u8, i8, i8)> = Vec::with_capacity(meta.glyphs.len());
   for g in &meta.glyphs {
-    glyphs_info.push((g.x, g.w, g.resolved_advance()));
+    glyphs_info.push((g.x, g.w, g.resolved_advance(), g.resolved_left()));
   }
 
   let glyph_count: u16 = glyphs_info
@@ -174,7 +180,7 @@ pub fn build_font_from_l8_and_meta(l8: &[u8], width: u16, height: u16, meta: &Fo
   // Fixed header is 0x2C bytes, then charset segments (7 bytes each)
   let fixed_header_len: usize = 0x2C; // 44 bytes
   let header_len: usize = fixed_header_len + segments.len() * 7;
-  let glyph_rec_len: usize = 4;
+  let glyph_rec_len: usize = 5;
   let glyph_table_len = glyph_rec_len * (glyph_count as usize);
   let glyph_table_offset: u32 = header_len as u32;
   let atlas_offset: u32 = (header_len + glyph_table_len) as u32;
@@ -186,7 +192,7 @@ pub fn build_font_from_l8_and_meta(l8: &[u8], width: u16, height: u16, meta: &Fo
 
   // Header
   out.extend_from_slice(b"MFNT"); // MAGIC
-  out.push(1); // VERSION
+  out.push(2); // VERSION
   out.push(0); // FLAGS
   out.extend_from_slice(&meta.line_height.to_le_bytes());
   out.extend_from_slice(&meta.ascent.to_le_bytes());
@@ -215,10 +221,11 @@ pub fn build_font_from_l8_and_meta(l8: &[u8], width: u16, height: u16, meta: &Fo
   }
 
   // Glyph table (always charset mode)
-  for (x, w, adv) in &glyphs_info {
+  for (x, w, adv, left) in &glyphs_info {
     out.extend_from_slice(&x.to_le_bytes());
     out.push(*w);
     out.push(*adv as u8);
+    out.push(*left as u8);
   }
 
   // Atlas blob
@@ -377,20 +384,23 @@ pub mod ttfgen {
         let top = place.top as i32;
 
         let adv_px = gmetrics.advance_width(gid);
-        let eff_adv_px = adv_px - (left as f32);
+        let left_i8 = super::ttfgen::saturate_i8(left as f32);
+        glyphs_vec.push(Glyph {
+          x: x_cursor as u16,
+          w: w.clamp(0, 255) as u8,
+          advance: Some(super::ttfgen::saturate_i8(adv_px)),
+          left: Some(left_i8),
+        });
 
         let mut gb = vec![0u8; (w.max(0) as usize) * (h.max(0) as usize)];
         if w > 0 && h > 0 {
           gb.copy_from_slice(&img.data);
         }
 
-        let gw = w.clamp(0, 255) as u8;
-        glyphs_vec.push(Glyph { x: x_cursor as u16, w: gw, advance: Some(saturate_i8(eff_adv_px)) });
-
         bitmaps.push((x_cursor as u16, left, top, w, h, gb));
         x_cursor = x_cursor.saturating_add(w.max(0) as u32);
       } else {
-        glyphs_vec.push(Glyph { x: x_cursor as u16, w: 0, advance: Some(0) });
+        glyphs_vec.push(Glyph { x: x_cursor as u16, w: 0, advance: Some(0), left: Some(0) });
       }
     }
 
@@ -497,9 +507,9 @@ mod tests {
       descent: -3,
       // 3 glyphs total (A..C)
       glyphs: vec![
-        Glyph { x: 0, w: 3, advance: Some(3) },
-        Glyph { x: 3, w: 2, advance: Some(2) },
-        Glyph { x: 5, w: 4, advance: Some(4) },
+        Glyph { x: 0, w: 3, advance: Some(3), left: Some(0) },
+        Glyph { x: 3, w: 2, advance: Some(2), left: Some(0) },
+        Glyph { x: 5, w: 4, advance: Some(4), left: Some(0) },
       ],
       kerning: vec![Kerning { left: "A".into(), right: "B".into(), adj: -1 }],
       charset: vec![CharsetRange { start: "A".into(), end: "C".into() }],
@@ -523,7 +533,7 @@ mod tests {
 
     // --- Fixed header checks ---
     assert_eq!(&bytes[0..4], b"MFNT");
-    assert_eq!(bytes[4], 1); // VERSION
+    assert_eq!(bytes[4], 2); // VERSION
     assert_eq!(bytes[5], 0); // FLAGS
     assert_eq!(u16_le(&bytes, 0x06), meta.line_height);
     assert_eq!(i16_le(&bytes, 0x08), meta.ascent);
@@ -546,7 +556,7 @@ mod tests {
     assert_eq!(charset_seg_count, 1);
 
     assert_eq!(glyph_table_offset, header_len);
-    assert_eq!(glyph_table_len, (glyph_count as usize) * 4);
+    assert_eq!(glyph_table_len, (glyph_count as usize) * 5);
     assert_eq!(atlas_offset, header_len + glyph_table_len);
 
     // Charset segment contents immediately after fixed header
@@ -558,19 +568,22 @@ mod tests {
     assert_eq!(seg_len, 3);
     assert_eq!(seg_base, 0);
 
-    // Glyph table layout: u16 x, u8 w, i8 advance (as u8 here)
+    // Glyph table layout: u16 x, u8 w, i8 advance, i8 left (as u8 here)
     // g0
     assert_eq!(u16_le(&bytes, glyph_table_offset + 0), 0);
     assert_eq!(bytes[glyph_table_offset + 2], 3);
     assert_eq!(bytes[glyph_table_offset + 3] as i8, 3);
+    assert_eq!(bytes[glyph_table_offset + 4] as i8, 0);
     // g1
-    assert_eq!(u16_le(&bytes, glyph_table_offset + 4), 3);
-    assert_eq!(bytes[glyph_table_offset + 6], 2);
-    assert_eq!(bytes[glyph_table_offset + 7] as i8, 2);
+    assert_eq!(u16_le(&bytes, glyph_table_offset + 5), 3);
+    assert_eq!(bytes[glyph_table_offset + 7], 2);
+    assert_eq!(bytes[glyph_table_offset + 8] as i8, 2);
+    assert_eq!(bytes[glyph_table_offset + 9] as i8, 0);
     // g2
-    assert_eq!(u16_le(&bytes, glyph_table_offset + 8), 5);
-    assert_eq!(bytes[glyph_table_offset + 10], 4);
-    assert_eq!(bytes[glyph_table_offset + 11] as i8, 4);
+    assert_eq!(u16_le(&bytes, glyph_table_offset + 10), 5);
+    assert_eq!(bytes[glyph_table_offset + 12], 4);
+    assert_eq!(bytes[glyph_table_offset + 13] as i8, 4);
+    assert_eq!(bytes[glyph_table_offset + 14] as i8, 0);
 
     // Inner atlas header: width, height at atlas_offset
     assert_eq!(u16_le(&bytes, atlas_offset + 0), w);
@@ -600,12 +613,12 @@ mod tests {
       descent: -5,
       glyphs: vec![
         // first segment (2)
-        Glyph { x: 0, w: 1, advance: None },
-        Glyph { x: 1, w: 2, advance: None },
+        Glyph { x: 0, w: 1, advance: None, left: Some(0) },
+        Glyph { x: 1, w: 2, advance: None, left: Some(0) },
         // second segment (3)
-        Glyph { x: 3, w: 3, advance: None },
-        Glyph { x: 6, w: 4, advance: None },
-        Glyph { x: 10, w: 5, advance: None },
+        Glyph { x: 3, w: 3, advance: None, left: Some(0) },
+        Glyph { x: 6, w: 4, advance: None, left: Some(0) },
+        Glyph { x: 10, w: 5, advance: None, left: Some(0) },
       ],
       kerning: vec![],
       charset: vec![
@@ -635,7 +648,7 @@ mod tests {
     let kerning_count = u32_le(&bytes, 0x26) as usize;
 
     assert_eq!(glyph_table_offset, header_len);
-    assert_eq!(glyph_table_len, 5 * 4);
+    assert_eq!(glyph_table_len, 5 * 5);
     assert_eq!(atlas_offset, header_len + glyph_table_len);
     assert_eq!(kerning_count, 0);
     assert_eq!(kerning_offset, 0);
@@ -672,7 +685,10 @@ mod tests {
       line_height: 8,
       ascent: 6,
       descent: -2,
-      glyphs: vec![Glyph { x: 0, w: 3, advance: None }, Glyph { x: 3, w: 2, advance: None }],
+      glyphs: vec![
+        Glyph { x: 0, w: 3, advance: None, left: Some(0) },
+        Glyph { x: 3, w: 2, advance: None, left: Some(0) },
+      ],
       kerning: vec![],
       charset: vec![CharsetRange { start: "A".into(), end: "C".into() }],
     };
