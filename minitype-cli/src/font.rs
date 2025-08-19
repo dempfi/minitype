@@ -37,7 +37,7 @@
 ///  - 4..20: palette[16] (u8)
 ///  - 20..(20 + ceil(h/8)): row mask
 ///  - ...: row payloads (for rows with mask bit=1)
-use super::atlas::{build_palette_u8, compress};
+use crate::atlas::{build_palette_u8, compress};
 use core::convert::TryInto;
 
 #[inline]

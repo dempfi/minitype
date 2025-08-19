@@ -9,3 +9,9 @@
   readme.workspace        = true
   repository.workspace    = true
   version.workspace       = true
+
+[dependencies]
+  defmt = { version = "0.1.0", optional = true }
+
+[features]
+  defmt = ["dep:defmt"]

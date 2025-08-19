@@ -15,6 +15,7 @@ use core::convert::TryInto;
 
 /// Parsing/validation errors
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error {
   /// Wrong magic (expected "ZFNT").
   BadMagic,

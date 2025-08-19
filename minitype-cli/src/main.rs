@@ -1,3 +1,6 @@
+mod atlas;
+mod font;
+
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Parser};
 use image::GenericImageView;
@@ -38,6 +41,11 @@ struct Cli {
   /// Font config JSON path (glyph positions/advances, metrics) [alternative to --ttf]
   #[arg(short = 'j', long = "json")]
   json: Option<PathBuf>,
+
+  /// If set, also write preview artifacts next to --output:
+  /// <output>.atlas.png and <output>.meta.json (TTF mode only)
+  #[arg(long = "preview", default_value_t = false)]
+  preview: bool,
 
   /// Output file (.mtt)
   #[arg(short, long)]
@@ -94,13 +102,16 @@ fn main() -> Result<()> {
     let (font, png, json_text) =
       ttfgen::build_from_ttf_with_artifacts(&ttf_bytes, size, &ranges).context("build from TTF")?;
 
-    // Derive sidecar paths from --output (Foo.mtf -> Foo.atlas.png / Foo.meta.json)
-    let base = cli.output.with_extension("");
-    let atlas_path = base.with_extension("atlas.png");
-    let meta_path = base.with_extension("meta.json");
+    // Optionally write preview artifacts when --preview is set
+    if cli.preview {
+      // Derive sidecar paths from --output (Foo.mtt -> Foo.atlas.png / Foo.meta.json)
+      let base = cli.output.with_extension("");
+      let atlas_path = base.with_extension("atlas.png");
+      let meta_path = base.with_extension("meta.json");
 
-    fs::write(&atlas_path, &png).with_context(|| format!("write {:?}", atlas_path))?;
-    fs::write(&meta_path, &json_text).with_context(|| format!("write {:?}", meta_path))?;
+      fs::write(&atlas_path, &png).with_context(|| format!("write {:?}", atlas_path))?;
+      fs::write(&meta_path, &json_text).with_context(|| format!("write {:?}", meta_path))?;
+    }
     font
   } else {
     let atlas_path = cli

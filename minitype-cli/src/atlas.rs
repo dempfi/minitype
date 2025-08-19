@@ -98,6 +98,7 @@ pub fn compress(pixels: &[u8], w: u16, h: u16) -> Vec<u8> {
 /// - If row mask bit is 1: read `ceil(width/2)` bytes, expand nibbles (LSB: left pixel) to palette values.
 ///
 /// Returns error if the file is too small or ends prematurely.
+#[allow(dead_code)]
 pub fn decompress(data: &[u8]) -> Result<(u16, u16, Vec<u8>), anyhow::Error> {
   use anyhow::anyhow;
   if data.len() < 20 {
