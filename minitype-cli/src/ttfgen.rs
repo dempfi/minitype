@@ -1,352 +1,206 @@
-// ============================
-// TTF → MiniType one-shot builder (artifacts for preview)
-// ============================
-
 use crate::font::{Atlas, CharsetRange, Glyph, Metadata, assemble};
-use anyhow::anyhow;
-use image::ImageEncoder as _;
-use swash::scale::{Render, ScaleContext, Source, StrikeWith};
-use swash::zeno::{Format, Vector};
-use swash::{FontRef, NormalizedCoord};
+use anyhow::{Result, anyhow};
+use rayon::ThreadPoolBuilder;
+use std::{collections::HashMap, sync::Arc};
+use ttf_parser::Face;
+use webrender_api::{
+  ColorF, FontInstanceFlags, FontInstanceKey, FontInstanceOptions, FontInstancePlatformOptions, FontKey,
+  FontRenderMode, FontTemplate, GlyphIndex, IdNamespace, units::DevicePoint,
+};
+use wr_glyph_rasterizer::{
+  BaseFontInstance, FontInstance, GlyphKey, GlyphRasterizer, RasterizedGlyph, SharedFontResources, SubpixelDirection,
+  profiler::GlyphRasterizeProfiler,
+};
 
-/// Build MiniType (MFNT) plus artifacts: quantized L8 PNG preview and JSON meta.
-/// Returns `(mfnt_bytes, png_l8_bytes, json_meta_text)`.
+/// Row in the single-row atlas.
+struct Row {
+  x: u16,
+  top: i32,
+  w: i32,
+  h: i32,
+  bytes: Vec<u8>, // L8 tightly packed (w * h)
+}
+
+/// Build MiniType (MFNT) + artifacts (PNG L8 preview + JSON meta).
 pub fn build_from_ttf_with_artifacts(
   ttf: &[u8],
   px: f32,
   ranges: &[(char, char)],
-) -> anyhow::Result<(Vec<u8>, Vec<u8>, String)> {
-  // ---- 1) Load font
-  let font = FontRef::from_index(ttf, 0).ok_or_else(|| anyhow!("failed to parse TTF font"))?;
-
-  // ---- 2) Expand charset
-  let mut charset: Vec<char> = Vec::new();
-  for &(start, end) in ranges {
-    if end < start {
-      return Err(anyhow!("range end < start: {:?}-{:?}", start, end));
-    }
-    let mut c = start as u32;
-    let end_u = end as u32;
-    while c <= end_u {
-      if let Some(ch) = char::from_u32(c) {
-        charset.push(ch);
-      }
-      c += 1;
-    }
-  }
-  if charset.is_empty() {
-    return Err(anyhow!("charset empty"));
+) -> Result<(Vec<u8>, Vec<u8>, String)> {
+  if px <= 0.0 {
+    return Err(anyhow!("px must be > 0"));
   }
 
-  // ---- 3) Metrics at requested size
-  let m_scaled = font.metrics(&[] as &[NormalizedCoord]).scale(px);
-  let ascent = m_scaled.ascent;
-  let descent = m_scaled.descent;
-  let line_gap = m_scaled.leading;
-  let line_height = (ascent + descent + line_gap).ceil().max(1.0) as u16;
+  // 1) Charset
+  let charset = expand_charset(ranges)?;
 
-  // Spacing
-  let gmetrics = font.glyph_metrics(&[] as &[NormalizedCoord]).scale(px);
+  // 2) Metrics
+  let face = Face::parse(ttf, 0)?;
+  let upem = face.units_per_em() as f32;
 
-  // ---- 4) Swash render setup (quality over speed)
-  let outline = [
-    Source::ColorOutline(0),
-    Source::ColorBitmap(StrikeWith::BestFit),
-    Source::Outline,
-  ];
-  let mut scale_ctx = ScaleContext::new();
-  let mut scaler = scale_ctx
-    .builder(font)
-    .size(px)
-    .hint(true) // rely on Swash hinting for crisp stems
-    .build();
-
-  // Toggle: try LCD subpixel and collapse to L8. Safer default is Alpha.
-  const TRY_LCD: bool = false;
-  let desired_format = if TRY_LCD { Format::Subpixel } else { Format::Alpha };
-
-  // --- helpers for LCD collapse and image scoring ---
-
-  #[inline]
-  fn to_linear(x: u8) -> f32 {
-    let xf = x as f32 / 255.0;
-    if xf <= 0.04045 {
-      xf / 12.92
-    } else {
-      ((xf + 0.055) / 1.055).powf(2.4)
-    }
-  }
-  #[inline]
-  fn to_srgb(x: f32) -> u8 {
-    let y = if x <= 0.0031308 {
-      12.92 * x
-    } else {
-      1.055 * x.powf(1.0 / 2.4) - 0.055
-    };
-    (y.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u8
-  }
-  #[inline]
-  fn collapse_row_rgb_to_l8(src: &[u8], out: &mut [u8]) {
-    // src len == out len * 3
-    let mut si = 0;
-    for dst in out.iter_mut() {
-      let r = to_linear(src[si]);
-      let g = to_linear(src[si + 1]);
-      let b = to_linear(src[si + 2]);
-      si += 3;
-      *dst = to_srgb((r + g + b) / 3.0);
-    }
-  }
-
-  #[inline]
-  fn abd(a: u8, b: u8) -> u32 {
-    a.max(b) as u32 - a.min(b) as u32
-  }
-
-  /// Edge-contrast + midtone penalty: favors crisp, inky glyphs (fewer 30–70% grays).
-  fn clarity_score_l8(buf: &[u8], w: i32, h: i32) -> u64 {
-    if w <= 1 || h <= 1 {
-      return 0;
-    }
-    let (w, h) = (w as usize, h as usize);
-    let mut edge: u64 = 0;
-    // horizontal
-    for y in 0..h {
-      let row = &buf[y * w..y * w + w];
-      for x in 1..w {
-        edge += abd(row[x], row[x - 1]) as u64;
-      }
-    }
-    // vertical
-    for y in 1..h {
-      let pr = &buf[(y - 1) * w..(y - 1) * w + w];
-      let rw = &buf[y * w..y * w + w];
-      for x in 0..w {
-        edge += abd(rw[x], pr[x]) as u64;
-      }
-    }
-    // mid-tone penalty
-    let mut mid: u64 = 0;
-    for &a in buf.iter().take(w * h) {
-      if !(a <= 24 || a >= 232) {
-        mid += u8::min(a, 255 - a) as u64;
-      }
-    }
-    edge.saturating_mul(3) - mid.saturating_mul(4)
-  }
-
-  /// Render one candidate at (ox,oy), producing L8 data (converting from LCD if needed) and a score.
-  fn render_candidate(
-    scaler: &mut swash::scale::Scaler,
-    outline: &[Source],
-    gid: u16,
-    format: Format,
-    ox: f32,
-    oy: f32,
-  ) -> Option<(i32, i32, i32, i32, Vec<u8>, u64)> {
-    let mut r = Render::new(outline);
-    r.format(format).offset(Vector::new(ox, oy));
-    let img = r.render(scaler, gid)?;
-    let w = img.placement.width.max(0) as i32;
-    let h = img.placement.height.max(0) as i32;
-    let left = img.placement.left as i32;
-    let top = img.placement.top as i32;
-    if w <= 0 || h <= 0 {
-      return Some((w, h, left, top, Vec::new(), 0));
-    }
-
-    let mut l8 = if format == Format::Subpixel {
-      let (wu, hu) = (w as usize, h as usize);
-      let need = wu.saturating_mul(hu).saturating_mul(3);
-      if need != img.data.len() {
-        // fall back to grayscale if the buffer isn’t exactly WXH*3
-        let mut r2 = Render::new(outline);
-        r2.format(Format::Alpha).offset(Vector::new(ox, oy));
-        if let Some(img2) = r2.render(scaler, gid) {
-          img2.data.clone()
-        } else {
-          Vec::new()
-        }
-      } else {
-        let mut out = vec![0u8; wu * hu];
-        for row in 0..hu {
-          let src = &img.data[row * (wu * 3)..row * (wu * 3) + (wu * 3)];
-          let dst = &mut out[row * wu..row * wu + wu];
-          collapse_row_rgb_to_l8(src, dst);
-        }
-        out
-      }
-    } else {
-      img.data.clone()
-    };
-
-    // gentle S-curve: lift black point a hair, nudge mids darker
-    soften_haze_curve_in_place(&mut l8, /*cut=*/ 4, /*gamma=*/ 1.1);
-
-    let score = clarity_score_l8(&l8, w, h);
-    Some((w, h, left, top, l8, score))
-  }
-
-  // Baseline snap suggestion:
-  let oy_base: f32 = (ascent.round() - ascent) as f32;
-  // Safety clamp (stay well within half a pixel)
-  const OY_CLAMP: f32 = 0.45;
-  let oy_center = oy_base.clamp(-OY_CLAMP, OY_CLAMP);
-
-  // X phases are reused for scoring at each candidate oy
-  const OX_CANDIDATES: &[f32] = &[0.0, -0.375, -0.25, -0.125, 0.125, 0.25, 0.375];
-
-  // Score a given oy by sampling up to N glyphs and taking the best X phase per glyph.
-  let sample_count = core::cmp::min(charset.len(), 96);
-  let mut score_oy = |oy: f32| -> u128 {
-    let mut total: u128 = 0;
-    for i in 0..sample_count {
-      let gid = font.charmap().map(charset[i]);
-      let mut best_for_glyph: u64 = 0;
-      for &ox in OX_CANDIDATES {
-        if let Some((_w, _h, _l, _t, _buf, sc)) = render_candidate(&mut scaler, &outline, gid, desired_format, ox, oy) {
-          if sc > best_for_glyph {
-            best_for_glyph = sc;
-          }
-        }
-      }
-      total += best_for_glyph as u128;
-    }
-    total
+  let (asc_u, desc_u, gap_u) = if let Some(os2) = face.tables().os2 {
+    (
+      os2.typographic_ascender() as f32,
+      os2.typographic_descender() as f32, // usually negative
+      os2.typographic_line_gap() as f32,
+    )
+  } else {
+    let hhea = face.tables().hhea;
+    (hhea.ascender as f32, hhea.descender as f32, hhea.line_gap as f32)
   };
 
-  // --- Coarse sweep around oy_center
-  const OY_COARSE_STEP: f32 = 0.125; // ~1/8 px
-  const OY_COARSE_RADIUS_STEPS: i32 = 3; // sweep center ± 3 steps
-  let mut best_oy = 0.0f32;
-  let mut best_score: u128 = 0;
+  let px_per_unit = px / upem;
+  let ascent_px = asc_u * px_per_unit;
+  let descent_px = (-desc_u) * px_per_unit; // make positive
+  let line_gap_px = gap_u.max(0.0) * px_per_unit;
 
-  for k in -OY_COARSE_RADIUS_STEPS..=OY_COARSE_RADIUS_STEPS {
-    let oy = (oy_center + k as f32 * OY_COARSE_STEP).clamp(-OY_CLAMP, OY_CLAMP);
-    let s = score_oy(oy);
-    if s > best_score || (k == -OY_COARSE_RADIUS_STEPS && best_score == 0) {
-      best_score = s;
-      best_oy = oy;
-    }
+  let line_height: u16 = (ascent_px + descent_px + line_gap_px).ceil().max(1.0) as u16;
+  let baseline_y: i32 = ascent_px.ceil() as i32; // y grows down
+  let atlas_h: u16 = (ascent_px + descent_px).ceil().max(1.0) as u16;
+
+  // 3) Rasterize (L8)
+  let rasters = rasterize_glyphs_wr(
+    ttf,
+    px,
+    &charset,
+    FontRenderMode::Alpha,
+    FontInstanceFlags::SUBPIXEL_POSITION,
+    SubpixelDirection::None,
+    DevicePoint::new(0.0, 0.0),
+  )?;
+  if rasters.len() != charset.len() {
+    return Err(anyhow!("rasterizer returned {} glyphs for {} chars", rasters.len(), charset.len()));
   }
 
-  // --- Refine sweep around the coarse winner
-  const OY_REFINE_STEP: f32 = 0.03125; // ~1/32 px
-  const OY_REFINE_RADIUS_STEPS: i32 = 4; // ± 4 * refine step ≈ ±0.125 px window
-  for k in -OY_REFINE_RADIUS_STEPS..=OY_REFINE_RADIUS_STEPS {
-    let oy = (best_oy + k as f32 * OY_REFINE_STEP).clamp(-OY_CLAMP, OY_CLAMP);
-    let s = score_oy(oy);
-    if s > best_score {
-      best_score = s;
-      best_oy = oy;
-    }
-  }
-
-  // --- Dead-zone: if result is tiny, prefer 0.0 (avoids imperceptible drift)
-  const OY_DEADZONE: f32 = 0.02;
-  let oy_global = if best_oy.abs() < OY_DEADZONE { 0.0 } else { best_oy };
-
-  let mut glyphs_vec: Vec<Glyph> = Vec::with_capacity(charset.len());
+  // 4) Build glyph records + pack single-row atlas
+  let mut glyphs_out = Vec::with_capacity(charset.len());
+  let mut rows = Vec::with_capacity(charset.len());
   let mut x_cursor: u32 = 0;
-  let mut bitmaps: Vec<(u16, i32, i32, i32, i32, Vec<u8>)> = Vec::with_capacity(charset.len());
 
-  for &ch in charset.iter() {
-    let gid = font.charmap().map(ch);
+  for (i, ch) in charset.iter().enumerate() {
+    let rg = &rasters[i];
 
-    // Try a few X subpixel phases with the chosen global Y offset; keep the crispiest.
-    let mut best: Option<(i32, i32, i32, i32, Vec<u8>, u64)> = None;
-    for &ox in OX_CANDIDATES {
-      if let Some(cand) = render_candidate(&mut scaler, &outline, gid, desired_format, ox, oy_global) {
-        best = match best {
-          None => Some(cand),
-          Some(prev) => {
-            if cand.5 > prev.5 {
-              Some(cand)
-            } else {
-              Some(prev)
-            }
-          }
-        };
-      }
+    let adv_i8 = {
+      let adv_px = face
+        .glyph_index(*ch)
+        .and_then(|gid| face.glyph_hor_advance(gid))
+        .map(|u| (u as f32) * px_per_unit)
+        .unwrap_or(0.0);
+      saturate_i8(adv_px.round())
+    };
+
+    if rg.width <= 0 || rg.height <= 0 {
+      push_empty_glyph(&mut glyphs_out, x_cursor as u16, adv_i8);
+      continue;
     }
 
-    if let Some((w, h, left, top, gb, _score)) = best {
-      // Advance width at requested size
-      let adv_px = gmetrics.advance_width(gid);
-      glyphs_vec.push(Glyph::new(
+    let mut w = rg.width as i32;
+    let mut h = rg.height as i32;
+    let mut left = rg.left.floor() as i32;
+    let mut top = rg.top.floor() as i32;
+
+    // Tighten to non-zero alpha bounds (stride == w; WR L8 is tightly packed)
+    if let Some((bytes, cw, ch_crop, dx, dy)) = crop_l8_tight(&rg.bytes, w, h) {
+      left += dx; // bytes left columns => bearing increases
+      top -= dy; // bytes top rows      => distance from baseline decreases
+      w = cw;
+      h = ch_crop;
+
+      glyphs_out.push(Glyph::new(
         x_cursor as u16,
-        w.clamp(0, 255) as u8,
-        Some(saturate_i8(adv_px)),
+        (w as u32).min(255) as u8,
+        Some(adv_i8),
         Some(saturate_i8(left as f32)),
       ));
 
-      bitmaps.push((x_cursor as u16, left, top, w, h, gb));
-      x_cursor = x_cursor.saturating_add(w.max(0) as u32);
+      rows.push(Row { x: x_cursor as u16, top, w, h, bytes });
+      x_cursor = x_cursor.saturating_add(w as u32);
     } else {
-      // Nothing rendered (e.g., missing glyph)
-      glyphs_vec.push(Glyph::new(x_cursor as u16, 0, Some(0), Some(0)));
+      // Truly empty after crop
+      push_empty_glyph(&mut glyphs_out, x_cursor as u16, adv_i8);
     }
   }
 
+  // 5) Compose L8 atlas
   let atlas_w: u16 = (x_cursor as u16).max(1);
-  let baseline_y = ascent.ceil() as i32;
-  let atlas_h = (ascent + descent).ceil().max(1.0) as u16;
+  let mut l8 = vec![0u8; (atlas_w as usize) * (atlas_h as usize)];
 
-  // ---- 6) Compose single-row L8 atlas
-  let mut l8 = vec![0u8; atlas_w as usize * atlas_h as usize];
-  for (x, _left, top, w, h, bm) in &bitmaps {
-    if *w <= 0 || *h <= 0 {
+  for row in &rows {
+    if row.w <= 0 || row.h <= 0 {
       continue;
     }
-    let dst_top = baseline_y - *top;
-    let dst_left = *x as i32;
-    for row in 0..*h {
-      let dst_y = dst_top + row;
-      if !(0..(atlas_h as i32)).contains(&dst_y) {
+    let dst_top = baseline_y - row.top;
+    let dst_left = row.x as i32;
+
+    for y in 0..row.h {
+      let dst_y = dst_top + y;
+      if dst_y < 0 || dst_y >= atlas_h as i32 {
         continue;
       }
       let dst_x = dst_left as usize;
-      let row_w = *w as usize;
+      let row_w = row.w as usize;
       let remaining = (atlas_w as usize).saturating_sub(dst_x);
-      let copy_w = core::cmp::min(row_w, remaining);
-      if copy_w > 0 {
-        let src_off = (row as usize) * row_w;
-        let dst_off = (dst_y as usize) * (atlas_w as usize) + dst_x;
-        let src = &bm[src_off..src_off + copy_w];
-        let dst = &mut l8[dst_off..dst_off + copy_w];
-        dst.copy_from_slice(src);
+      let copy_w = row_w.min(remaining);
+      if copy_w == 0 {
+        continue;
       }
+
+      let src_off = (y as usize) * row_w;
+      let dst_off = (dst_y as usize) * (atlas_w as usize) + dst_x;
+
+      debug_assert!(src_off + copy_w <= row.bytes.len());
+      debug_assert!(dst_off + copy_w <= l8.len());
+
+      l8[dst_off..dst_off + copy_w].copy_from_slice(&row.bytes[src_off..src_off + copy_w]);
     }
   }
 
-  // ---- 7) JSON meta
+  // 6) JSON meta
   let charset_json: Vec<CharsetRange> = ranges
     .iter()
     .map(|(s, e)| CharsetRange { start: s.to_string(), end: e.to_string() })
     .collect();
+
   let meta = Metadata {
     line_height,
-    ascent: ascent.round() as i16,
-    descent: descent.round() as i16,
-    glyphs: glyphs_vec,
+    ascent: ascent_px.round() as i16,
+    descent: descent_px.round() as i16,
+    glyphs: glyphs_out,
     kerning: Vec::new(),
     charset: charset_json,
   };
   let json_text = serde_json::to_string_pretty(&meta)?;
 
-  // ---- 8) PNG preview (L8)
+  // 7) PNG preview (L8)
   let png = encode_l8_png(&l8, atlas_w, atlas_h)?;
 
-  // ---- 9) Build MFNT from L8 + meta
+  // 8) Assemble
   let atlas = Atlas::new(atlas_w, atlas_h, l8)?;
-  let mfnt = assemble(meta, atlas)?;
-
-  Ok((mfnt, png, json_text))
+  let font = assemble(meta, atlas)?;
+  Ok((font, png, json_text))
 }
 
-/// Encode an L8 grayscale image to PNG bytes.
-fn encode_l8_png(pixels: &[u8], w: u16, h: u16) -> anyhow::Result<Vec<u8>> {
-  use image::{ExtendedColorType, codecs::png::PngEncoder};
+fn expand_charset(ranges: &[(char, char)]) -> Result<Vec<char>> {
+  let mut out = Vec::new();
+  for &(start, end) in ranges {
+    if end < start {
+      return Err(anyhow!("range end < start: {start:?}-{end:?}"));
+    }
+    let mut c = start as u32;
+    let end_u = end as u32;
+    while c <= end_u {
+      if let Some(ch) = char::from_u32(c) {
+        out.push(ch);
+      }
+      c += 1;
+    }
+  }
+  Ok(out)
+}
+
+// Encode an L8 grayscale image to PNG bytes.
+fn encode_l8_png(pixels: &[u8], w: u16, h: u16) -> Result<Vec<u8>> {
+  use image::{ExtendedColorType, ImageEncoder as _, codecs::png::PngEncoder};
   let mut out = Vec::new();
   PngEncoder::new(&mut out).write_image(pixels, w as u32, h as u32, ExtendedColorType::L8)?;
   Ok(out)
@@ -364,20 +218,172 @@ pub(super) fn saturate_i8(v: f32) -> i8 {
   }
 }
 
-/// Apply a gentle S-curve to reduce haze.
-/// `cut` lifts the black point a little (0..30 recommended).
-/// `gamma` (>1) darkens mid-tones slightly.
-fn soften_haze_curve_in_place(buf: &mut [u8], cut: u8, gamma: f32) {
-  let inv = 1.0 / 255.0;
-  let cutf = cut as f32 * inv;
-  for p in buf.iter_mut() {
-    let x = *p as f32 * inv;
-    // piecewise: below cut → 0; above cut → re-normalize to 0..1 and apply gamma
-    let y = if x <= cutf {
-      0.0
-    } else {
-      ((x - cutf) / (1.0 - cutf)).powf(gamma)
-    };
-    *p = (y * 255.0 + 0.5).floor() as u8;
+/// Rasterize the requested characters from raw font bytes using wr_glyph_rasterizer.
+pub fn rasterize_glyphs_wr(
+  font_bytes: &[u8],
+  px: f32,
+  chars: &[char],
+  render_mode: FontRenderMode,
+  flags: FontInstanceFlags,
+  subpixel_dir: SubpixelDirection,
+  device_pos: DevicePoint,
+) -> Result<Vec<RasterizedGlyph>> {
+  if px <= 0.0 {
+    return Err(anyhow!("px must be > 0"));
   }
+
+  // Shared font registry
+  let namespace = IdNamespace(0);
+  let mut fonts = SharedFontResources::new(namespace);
+
+  let font_key = FontKey::new(namespace, 0);
+  let font_template = FontTemplate::Raw(Arc::new(font_bytes.to_vec()), 0);
+  let shared_font_key = fonts
+    .font_keys
+    .add_key(&font_key, &font_template)
+    .expect("Failed to add font key");
+  fonts.templates.add_font(shared_font_key, font_template);
+
+  // Font instance
+  let font_instance_key = FontInstanceKey::new(namespace, 1);
+  let base = BaseFontInstance::new(
+    font_instance_key,
+    shared_font_key,
+    px,
+    Some(FontInstanceOptions::default()),
+    Some(FontInstancePlatformOptions::default()),
+    Vec::new(), // variations
+  );
+  let shared_instance = fonts
+    .instance_keys
+    .add_key(base)
+    .expect("Failed to add font instance key");
+  fonts.instances.add_font_instance(shared_instance);
+
+  // Workers + rasterizer
+  let workers = Arc::new(
+    ThreadPoolBuilder::new()
+      .thread_name(|i| format!("WRWorker#{i}"))
+      .build()
+      .map_err(|e| anyhow!("Failed to create worker pool: {e}"))?,
+  );
+
+  let mut ras = GlyphRasterizer::new(workers, None, true);
+  ras.add_font(
+    shared_font_key,
+    fonts
+      .templates
+      .get_font(&shared_font_key)
+      .ok_or_else(|| anyhow!("Missing FontTemplate"))?,
+  );
+
+  let font = fonts
+    .instances
+    .get_font_instance(font_instance_key)
+    .ok_or_else(|| anyhow!("Missing BaseFontInstance"))?;
+  let mut instance = FontInstance::new(font, ColorF::BLACK.into(), render_mode, flags);
+  ras.prepare_font(&mut instance);
+
+  // Map chars → glyph indices → keys (preserve order)
+  let mut keys = Vec::with_capacity(chars.len());
+  for &ch in chars {
+    let gidx: GlyphIndex = ras
+      .get_glyph_index(shared_font_key, ch)
+      .ok_or_else(|| anyhow!("No glyph for U+{:04X}", ch as u32))?;
+    keys.push(GlyphKey::new(gidx, device_pos, subpixel_dir));
+  }
+
+  // Queue + resolve
+  ras.request_glyphs(instance, &keys, |_| true);
+
+  let mut map: HashMap<GlyphKey, RasterizedGlyph> = HashMap::with_capacity(keys.len());
+  ras.resolve_glyphs(
+    |job, _| {
+      map.insert(job.key, job.result.unwrap());
+    },
+    &mut Profiler,
+  );
+
+  let mut out = Vec::with_capacity(keys.len());
+  for key in keys {
+    out.push(map.remove(&key).expect("missing raster for key"));
+  }
+  Ok(out)
+}
+
+struct Profiler;
+impl GlyphRasterizeProfiler for Profiler {
+  fn start_time(&mut self) {}
+  fn end_time(&mut self) -> f64 {
+    0.0
+  }
+  fn set(&mut self, _value: f64) {}
+}
+
+/// Crop tightly to non-zero alpha. Returns (bytes, w, h, dx, dy),
+/// where (dx, dy) is the offset of the crop rect relative to the original bitmap.
+#[inline]
+fn crop_l8_tight(bytes: &[u8], w: i32, h: i32) -> Option<(Vec<u8>, i32, i32, i32, i32)> {
+  if w <= 0 || h <= 0 {
+    return None;
+  }
+  let (w_us, h_us) = (w as usize, h as usize);
+
+  let mut found_any = false;
+  let mut min_x = w_us;
+  let mut max_x = 0usize;
+  let mut min_y = h_us;
+  let mut max_y = 0usize;
+
+  for y in 0..h_us {
+    let row = &bytes[y * w_us..(y + 1) * w_us];
+
+    // first/last non-zero in this row
+    let mut lx = None;
+    let mut rx = None;
+    for (x, &p) in row.iter().enumerate() {
+      if p != 0 {
+        if lx.is_none() {
+          lx = Some(x);
+        }
+        rx = Some(x);
+      }
+    }
+    if let (Some(l), Some(r)) = (lx, rx) {
+      found_any = true;
+      if y < min_y {
+        min_y = y;
+      }
+      if y > max_y {
+        max_y = y;
+      }
+      if l < min_x {
+        min_x = l;
+      }
+      if r > max_x {
+        max_x = r;
+      }
+    }
+  }
+
+  if !found_any {
+    return None;
+  }
+
+  let cw = (max_x - min_x + 1) as i32;
+  let ch = (max_y - min_y + 1) as i32;
+
+  let mut out = vec![0u8; (cw as usize) * (ch as usize)];
+  for yy in 0..(ch as usize) {
+    let src_off = (min_y + yy) * w_us + min_x;
+    let dst_off = yy * (cw as usize);
+    out[dst_off..dst_off + (cw as usize)].copy_from_slice(&bytes[src_off..src_off + (cw as usize)]);
+  }
+
+  Some((out, cw, ch, min_x as i32, min_y as i32))
+}
+
+#[inline]
+fn push_empty_glyph(out: &mut Vec<Glyph>, x: u16, adv_i8: i8) {
+  out.push(Glyph::new(x, 0, Some(adv_i8), Some(0)));
 }

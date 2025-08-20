@@ -26,6 +26,7 @@ where
   }
 
   /// Returns the vertical offset between the line position and the top edge of the bounding box.
+  #[inline]
   fn baseline_offset(&self, baseline: Baseline) -> i32 {
     match baseline {
       Baseline::Top => 0,
@@ -47,7 +48,7 @@ where
   where
     D: DrawTarget<Color = Self::Color>,
   {
-    // Baseline-aligned origin for the strip
+    // Baseline-aligned origin for the *tight* strip.
     let origin = position - Point::new(0, self.baseline_offset(baseline));
 
     let mut pen_x = origin.x;
@@ -68,9 +69,11 @@ where
         continue;
       };
 
-      // Destination top-left for this glyph strip (apply left side bearing)
+      // Destination top-left for this glyph strip:
+      // - apply left side bearing,
+      // - shift down by atlas_y_off because rows are tight-cropped.
       let dst_x0 = pen_x + meta.left as i32;
-      let dst_y0 = origin.y;
+      let dst_y0 = origin.y + self.font.atlas_y_off as i32;
 
       if let Some(iter) = self.font.glyph_iter_for_index(idx) {
         let w = iter.width() as usize;
@@ -106,11 +109,13 @@ where
   where
     D: DrawTarget<Color = Self::Color>,
   {
+    // Keep baseline math consistent with draw_string (no rendering).
     let position = position - Point::new(0, self.baseline_offset(baseline));
     Ok(position + Point::new(width as i32, self.baseline_offset(baseline)))
   }
 
   fn measure_string(&self, text: &str, position: Point, baseline: Baseline) -> TextMetrics {
+    // Baseline-aligned top of the *tight* band.
     let bb_position = position - Point::new(0, self.baseline_offset(baseline));
     let mut bb_width: u32 = 0;
     let mut min_left: i32 = 0;
@@ -135,8 +140,11 @@ where
     }
 
     let extra_left = (-min_left).max(0) as u32;
+
+    // Height is the tight band; origin is shifted by atlas_y_off to match draw_string().
     let bb_size = Size::new(bb_width.saturating_add(extra_left), self.font.atlas_height as u32);
-    let bb_origin = bb_position + Point::new(min_left, 0);
+    let bb_origin = bb_position + Point::new(min_left, self.font.atlas_y_off as i32);
+
     TextMetrics {
       bounding_box: Rectangle::new(bb_origin, bb_size),
       next_position: position + Point::new(bb_width as i32, 0),

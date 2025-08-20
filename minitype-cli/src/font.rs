@@ -1,24 +1,23 @@
 //! MiniType font: compact, MCU-friendly container + *optimal* atlas packing.
-//
-// Atlas blob layout (from `Atlas::build_multi`):
-//   u16 w, u16 h,
-//   [u8;64] palettes (4×16; index 0 = black in each),
-//   rowmask[ceil(h/8)],
-//   rows (L4, 2px/byte; only for rows with rowmask bit set)
-//
-// MFNT layout:
-//   "MFNT", u8 version=1, u8 flags=0,
-//   u16 line_height, i16 ascent, i16 descent,
-//   u16 glyph_count,
-//   u32 glyphs_off, u32 glyphs_len,
-//   u32 atlas_off,  u32 atlas_len,
-//   u32 total_len (backpatch),
-//   u32 kerning_off (backpatch), u32 kerning_cnt (backpatch),
-//   u16 segment_count,
-//   segment_count × { u24 start_cp, u16 len, u16 base },
-//   glyph table (u16 x, u8 w, i8 advance, i8 left, u8 q),
-//   atlas blob,
-//   kerning table (u24 left_cp, u24 right_cp, i8 adj).
+//!
+//! Atlas blob layout (from `Atlas::build_multi`):
+//!   u16 w, u16 h_tight, u16 y_off,
+//!   [u8;64] palettes (4×16; index 0 = black in each),
+//!   rows (L4, 2px/byte; contiguous rows for y ∈ [y_off .. y_off + h_tight))
+//!
+//! MFNT layout:
+//!   "MFNT", u8 version=1, u8 flags=0,
+//!   u16 line_height, i16 ascent, i16 descent,
+//!   u16 glyph_count,
+//!   u32 glyphs_off, u32 glyphs_len,
+//!   u32 atlas_off,  u32 atlas_len,
+//!   u32 total_len (backpatch),
+//!   u32 kerning_off (backpatch), u32 kerning_cnt (backpatch),
+//!   u16 segment_count,
+//!   segment_count × { u24 start_cp, u16 len, u16 base },
+//!   glyph table (u16 x, u8 w, i8 advance, i8 left, u8 q),
+//!   atlas blob,
+//!   kerning table (u24 left_cp, u24 right_cp, i8 adj).
 
 use core::convert::TryInto;
 
@@ -173,7 +172,7 @@ pub struct Atlas {
 #[derive(Debug)]
 pub struct AtlasBlob {
   pub qbytes: Vec<u8>, // per-glyph quantization bytes
-  pub data: Vec<u8>,   // serialized blob (w,h,palettes,rowmask,rows)
+  pub data: Vec<u8>,   // serialized blob (w,h_tight,y_off,palettes,rows)
 }
 
 impl Atlas {
@@ -280,54 +279,69 @@ impl Atlas {
     }
 
     // --- Serialize atlas: w,h, palettes(4×16), rowmask, rows(L4) --------------
-    let rowmask_len = (h + 7) / 8;
-    let mut blob =
-      Vec::with_capacity(4 + (PALETTE_COUNT * PALETTE_SIZE) + rowmask_len + h * ((w + 1) / L4_PIXELS_PER_BYTE));
 
-    // Header: width/height.
+    // Compute tight vertical bounds in L8 source (any non-zero pixel counts).
+    let mut y_min = h; // first non-empty row (inclusive)
+    let mut y_max = 0usize; // last  non-empty row (inclusive)
+    for row in 0..h {
+      let base = row * w;
+      // Fast scan: early-out as soon as we see a non-zero pixel.
+      if self.pixels[base..base + w].iter().any(|&px| px != 0) {
+        y_min = y_min.min(row);
+        y_max = y_max.max(row);
+      }
+    }
+
+    // Handle all-black atlas gracefully.
+    let (y_off, h_tight) = if y_min <= y_max {
+      (y_min as u16, (y_max - y_min + 1) as u16)
+    } else {
+      // No non-zero rows: empty payload (keep y_off=0, h_tight=0).
+      (0u16, 0u16)
+    };
+
+    // Header (6 bytes) + palettes + tight rows
+    let rows_bytes_per_row = (w + 1) / L4_PIXELS_PER_BYTE;
+    let tight_rows_len = (h_tight as usize) * rows_bytes_per_row;
+    let mut blob = Vec::with_capacity(6 + (PALETTE_COUNT * PALETTE_SIZE) + tight_rows_len);
+
+    // Header: width, h_tight, y_off.
     blob.extend_from_slice(&self.width.to_le_bytes());
-    blob.extend_from_slice(&self.height.to_le_bytes());
+    blob.extend_from_slice(&h_tight.to_le_bytes());
+    blob.extend_from_slice(&y_off.to_le_bytes());
 
     // Palettes (index 0 must be 0 for “transparent/black”).
     for pid in 0..PALETTE_COUNT {
       blob.extend_from_slice(&palettes[pid]);
     }
 
-    // Reserve rowmask region; we'll set bits as we encode rows.
-    let mask_off = blob.len();
-    blob.resize(mask_off + rowmask_len, 0);
+    // Encode ONLY the contiguous tight band.
+    if h_tight > 0 {
+      let y_start = y_off as usize;
+      let y_end_excl = y_start + h_tight as usize;
 
-    // Encode rows; write only non-empty rows to save space.
-    for row in 0..h {
-      let base = row * w;
-      let mut packed_row = Vec::with_capacity((w + 1) / L4_PIXELS_PER_BYTE);
-      let mut any_nonzero = false;
+      for row in y_start..y_end_excl {
+        let base = row * w;
+        let mut packed_row = Vec::with_capacity(rows_bytes_per_row);
 
-      let mut x = 0usize;
-      while x < w {
-        // Left pixel → low nibble
-        let pid_l = palette_for_x[x] as usize;
-        let il = nearest[pid_l][self.pixels[base + x] as usize] & 0x0F;
+        let mut x = 0usize;
+        while x < w {
+          // Left pixel → low nibble
+          let pid_l = palette_for_x[x] as usize;
+          let il = nearest[pid_l][self.pixels[base + x] as usize] & 0x0F;
 
-        // Right pixel → high nibble (if present)
-        let (ir, right_nz) = if x + 1 < w {
-          let pid_r = palette_for_x[x + 1] as usize;
-          let ir = nearest[pid_r][self.pixels[base + x + 1] as usize] & 0x0F;
-          (ir, ir != 0)
-        } else {
-          (0u8, false)
-        };
+          // Right pixel → high nibble (if present)
+          let ir = if x + 1 < w {
+            let pid_r = palette_for_x[x + 1] as usize;
+            nearest[pid_r][self.pixels[base + x + 1] as usize] & 0x0F
+          } else {
+            0u8
+          };
 
-        if il != 0 || right_nz {
-          any_nonzero = true;
+          packed_row.push((ir << 4) | il);
+          x += 2;
         }
-        packed_row.push((ir << 4) | il);
-        x += 2;
-      }
 
-      if any_nonzero {
-        // Mark bit for this row in rowmask and append packed row payload.
-        blob[mask_off + row / 8] |= 1 << (row as u8 & 7);
         blob.extend_from_slice(&packed_row);
       }
     }

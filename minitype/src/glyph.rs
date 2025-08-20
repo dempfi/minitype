@@ -16,11 +16,8 @@ pub struct GlyphIter<'a> {
   fused_lut: [u8; 16],
 
   // iteration state
-  y: u16,
-  remaining_in_row: u16,
-  payload_cursor: usize, // global cursor across present rows
-  // per-row decoding state (valid only while remaining_in_row > 0)
-  row_present: bool,
+  y: u16,                // 0..font.atlas_height (tight)
+  remaining_in_row: u16, // countdown over glyph width
   row_byte_index: usize, // row start + (x/2)
   use_high: bool,        // if true -> use high nibble of current byte
   cur_byte: u8,
@@ -38,19 +35,14 @@ impl<'a> GlyphIter<'a> {
     lut[0] = 0;
 
     // Weighted blend: favor bias/step (captures glyph-specific dynamic) but
-    // still respect palette curvature.  fused = round((3*p + 5*t)/8).
-    // This works well across light/dark glyphs without ringing.
+    // still respect palette curvature. fused = round((3*p + 5*t)/8).
     let mut prev = 0u16;
     let mut n = 1usize;
     while n < 16 {
       let p = palette[n] as u16;
       let t_raw = bias + step.saturating_mul(n as u16);
       let t = if t_raw > 255 { 255 } else { t_raw } as u16;
-
-      // fused = round((3*p + 5*t)/8)  ( +4 for rounding )
       let fused = ((3 * p + 5 * t + 4) >> 3) as u16;
-
-      // Monotonic forward pass (cheap isotonic approximation).
       let m = if fused < prev { prev } else { fused };
       prev = m;
       lut[n] = m as u8;
@@ -63,8 +55,6 @@ impl<'a> GlyphIter<'a> {
       fused_lut: lut,
       y: 0,
       remaining_in_row: 0, // triggers row init on first `next()`
-      payload_cursor: font.payload_off,
-      row_present: false,
       row_byte_index: 0,
       use_high: false,
       cur_byte: 0,
@@ -76,28 +66,33 @@ impl<'a> GlyphIter<'a> {
     self.meta.w as u16
   }
 
+  /// Height of the tight band serialized in the atlas.
   #[inline]
   pub fn height(&self) -> u16 {
     self.font.atlas_height
   }
 
-  // Initialize state for the next row (if any).
+  /// Vertical offset of the tight band within the original full-height atlas.
+  /// Useful if your renderer needs absolute Y positioning.
+  #[inline]
+  pub fn y_offset(&self) -> u16 {
+    self.font.atlas_y_off
+  }
+
+  // Initialize state for the next row, if any.
+  #[inline]
   fn begin_row(&mut self) -> bool {
     if self.y >= self.font.atlas_height {
       return false;
     }
-    self.row_present = self.font.row_present(self.y);
     self.remaining_in_row = self.meta.w as u16;
 
-    if self.row_present {
-      // Compute row start in payload (current payload_cursor), then
-      // position at the glyph's x offset.
-      let row_start = self.payload_cursor;
-      let x = self.meta.x as usize;
-      self.row_byte_index = row_start + (x / 2);
-      self.use_high = (x & 1) != 0; // odd x starts at the high nibble
-      self.cur_byte = self.font.data[self.row_byte_index];
-    }
+    // Compute row start in contiguous payload, then position at glyph.x.
+    let row_start = self.font.payload_off + (self.y as usize) * self.font.row_stride_bytes;
+    let x = self.meta.x as usize;
+    self.row_byte_index = row_start + (x / 2);
+    self.use_high = (x & 1) != 0; // odd x starts at the high nibble
+    self.cur_byte = self.font.data[self.row_byte_index];
     true
   }
 
@@ -115,52 +110,34 @@ impl<'a> Iterator for GlyphIter<'a> {
     loop {
       // Start a new row if needed.
       if self.remaining_in_row == 0 {
-        if self.y >= self.font.atlas_height {
-          return None;
-        }
-        // If we just finished a present row, advance payload_cursor by stride.
-        if self.y > 0 {
-          let prev_y = self.y - 1;
-          if self.font.row_present(prev_y) {
-            self.payload_cursor += self.font.row_stride_bytes;
-          }
-        }
-        // Begin current row
         if !self.begin_row() {
           return None;
         }
-        self.y += 1; // mark that row is active (y counts rows consumed)
+        self.y += 1; // row is now active
       }
 
       // Emit one pixel from the current row.
-      if self.row_present {
-        let b = self.cur_byte;
-        let nib = if self.use_high { (b >> 4) & 0x0F } else { b & 0x0F };
+      let b = self.cur_byte;
+      let nib = if self.use_high { (b >> 4) & 0x0F } else { b & 0x0F };
 
-        // Reconstruct alpha via fused LUT.
-        let alpha = self.expand_nibble(nib);
+      // Reconstruct alpha via fused LUT.
+      let alpha = self.expand_nibble(nib);
 
-        // Update nibble state.
-        if self.use_high {
-          // consumed high nibble; move to next byte
-          self.row_byte_index += 1;
-          // Only load next byte if more pixels remain.
-          if self.remaining_in_row > 1 {
-            self.cur_byte = self.font.data[self.row_byte_index];
-          }
-          self.use_high = false;
-        } else {
-          // consumed low nibble; next is high of the same byte
-          self.use_high = true;
+      // Update nibble/byte state.
+      if self.use_high {
+        // consumed high nibble; move to next byte
+        self.row_byte_index += 1;
+        if self.remaining_in_row > 1 {
+          self.cur_byte = self.font.data[self.row_byte_index];
         }
-
-        self.remaining_in_row -= 1;
-        return Some(alpha);
+        self.use_high = false;
       } else {
-        // Whole row is black.
-        self.remaining_in_row -= 1;
-        return Some(0);
+        // consumed low nibble; next is high of the same byte
+        self.use_high = true;
       }
+
+      self.remaining_in_row -= 1;
+      return Some(alpha);
     }
   }
 }

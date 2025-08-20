@@ -1,0 +1,22 @@
+{
+  "configurations": [
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:minitype}/minitype-ct",
+      "name": "Debug minitype-ct (minitype-ct)",
+      "program": "${workspaceFolder:minitype}/minitype-ct/.build/debug/minitype-ct",
+      "preLaunchTask": "swift: Build Debug minitype-ct (minitype-ct)"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:minitype}/minitype-ct",
+      "name": "Release minitype-ct (minitype-ct)",
+      "program": "${workspaceFolder:minitype}/minitype-ct/.build/release/minitype-ct",
+      "preLaunchTask": "swift: Build Release minitype-ct (minitype-ct)"
+    }
+  ]
+}

@@ -14,7 +14,7 @@
   defmt                  = { version = "0.1.0", optional = true }
   embedded-graphics      = "0.8.1"
   embedded-graphics-core = "0.4.0"
-  embedded-rgba          = "0.1.0"
+  embedded-rgba          = "0.1.1"
 
 [features]
   defmt = ["dep:defmt"]
