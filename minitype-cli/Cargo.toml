@@ -1,7 +1,9 @@
 [package]
-  keywords = ["embedded"]
-  name     = "minitype-cli"
+  categories = ["embedded", "graphics", "no-std"]
+  keywords   = ["embedded", "font", "bitmap", "no-std"]
+  name       = "minitype-cli"
 
+  description             = "CLI for MiniType font conversion — a tiny, efficient bitmap font format for embedded_graphics"
   documentation.workspace = true
   edition.workspace       = true
   homepage.workspace      = true
@@ -15,12 +17,13 @@
   path = "src/main.rs"
 
 [dependencies]
-  anyhow              = "1.0.99"
-  clap                = { version = "4.5", features = ["derive"] }
-  image               = { version = "0.25" }
-  rayon               = "1.11.0"
-  serde               = { version = "1.0.219", features = ["derive"] }
-  serde_json          = "1.0.142"
-  ttf-parser          = "0.25.1"
-  webrender_api       = { git = "https://github.com/servo/webrender.git" }
-  wr_glyph_rasterizer = { git = "https://github.com/servo/webrender.git" }
+  anyhow     = "1.0.99"
+  clap       = { version = "4.5", features = ["derive"] }
+  image      = { version = "0.25" }
+  rayon      = "1.11.0"
+  serde      = { version = "1.0.219", features = ["derive"] }
+  serde_json = "1.0.142"
+  ttf-parser = "0.25.1"
+
+  zng-webrender-api       = "0.65.0"
+  zng-wr-glyph-rasterizer = "0.4.0"

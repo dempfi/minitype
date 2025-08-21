@@ -1,52 +1,29 @@
-//! MiniType font: compact, MCU-friendly container + per-glyph L4-bytes RLE atlas.
+//! MiniType (v0, compact header; reordered tables)
 //!
-//! Atlas blob layout (Per-Glyph RLE over **bytes**, each byte = 2 L4 pixels):
-//!   u16 w_total, u16 h_tight, u16 y_off,
-//!   glyph_0_rle, glyph_1_rle, … glyph_{N-1}_rle
-//!
-//!   For glyph i of width w_i, the encoder packs rows as L4 bytes:
-//!     byte = (right<<4) | left, low nibble = left pixel
-//!   For odd w_i, the last byte of each row has high nibble = 0.
-//!   The RLE stream is over these BYTES (row-major, contiguous rows).
-//!
-//! RLE packets (BYTES):
-//!   - Literal: opcode in [0x00..0x7F] => len = opcode+1 bytes; then `len` raw bytes.
-//!   - Run:     opcode in [0x80..0xFF] => len = (op&0x7F)+1 bytes; then 1 byte value to repeat.
-//!     (Encoder uses run threshold >= 3 bytes; max len per packet = 128.)
-//!
-//! MFNT layout:
-//!   "MFNT", u8 version=1, u8 flags,            // flags bit1=1 -> PerGlyph RLE L4-bytes
-//!   u16 line_height, i16 ascent, i16 descent,
+//! Order:
+//!   "MFNT"(4), u8 version=0, u8 flags=0 (reserved)
+//!   u8 line_height, i8 ascent, i8 descent,
+//!   u8 segment_count,
+//!   segment_count × { u24 start_cp, u16 len },                // 5 bytes/segment
 //!   u16 glyph_count,
-//!   u32 glyphs_off, u32 glyphs_len,
-//!   u32 atlas_off,  u32 atlas_len,
-//!   u32 total_len (backpatch),
-//!   u32 kerning_off (backpatch), u32 kerning_cnt (backpatch),
-//!   u16 segment_count,
-//!   segment_count × { u24 start_cp, u16 len, u16 base },
-//!   glyph table (u16 x, u8 w, i8 advance, i8 left, u16 next_off), // 7 B/record
-//!   atlas blob,
-//!   kerning table (u24 left_cp, u24 right_cp, i8 adj).
+//!   glyph_table   (glyph_count × 6 bytes/rec),
+//!   atlas_blob,
+//!   [ u16 kerning_count,                                    // OPTIONAL
+//!     kerning_table (kerning_count × 5 bytes/pair) ]        // {u16,u16,i8}
+//!
+//! Glyph record (6 bytes, little-endian bit packing):
+//!   u7 w, u7 h, u7 yoff, i5 adv_delta_to_w, i4 left_bearing, u18 blob_off
+//!
+//! L4: 2 px/byte, low nibble = left pixel (0..15).
 
 use core::convert::TryInto;
 
 const MAGIC: &[u8; 4] = b"MFNT";
-const VERSION: u8 = 1;
-
-/// MFNT header bytes before charset segments start (fixed-size prefix).
-const HDR_PREFIX_LEN: usize = 0x2C;
-
-/// MFNT.flags bit1: atlas is Per-Glyph RLE L4 **bytes** (bit0 reserved).
-const MFNT_FLAG_ATLAS_PGRLE: u8 = 0b0000_0010;
-
-#[inline]
-fn quant_l4_round(v: u8) -> u8 {
-  let idx = ((v as u16 + 8) / 16) as u16;
-  if idx > 15 { 15 } else { idx as u8 }
-}
+const VERSION: u8 = 0;
+const L4_PIXELS_PER_BYTE: usize = 2;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// metadata types
+// metadata
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -61,40 +38,59 @@ pub struct Metadata {
   pub charset: Vec<CharsetRange>,
 }
 
+impl Metadata {
+  #[inline]
+  pub fn line_height_u8(&self) -> anyhow::Result<u8> {
+    if (1..=255).contains(&self.line_height) {
+      Ok(self.line_height as u8)
+    } else {
+      anyhow::bail!("line_height={} out of u8 (1..=255)", self.line_height)
+    }
+  }
+  #[inline]
+  pub fn ascent_i8(&self) -> anyhow::Result<i8> {
+    if (-128..=127).contains(&self.ascent) {
+      Ok(self.ascent as i8)
+    } else {
+      anyhow::bail!("ascent={} out of i8", self.ascent)
+    }
+  }
+  #[inline]
+  pub fn descent_i8(&self) -> anyhow::Result<i8> {
+    if (-128..=127).contains(&self.descent) {
+      Ok(self.descent as i8)
+    } else {
+      anyhow::bail!("descent={} out of i8", self.descent)
+    }
+  }
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Glyph {
-  pub x: u16,
-  pub w: u8,
+  pub x: u16, // column in source A8 atlas
+  pub w: u8,  // tight width (px)
   #[serde(default)]
   pub advance: Option<i8>,
   #[serde(default)]
   pub left: Option<i8>,
 }
-
 impl Glyph {
   pub fn new(x: u16, w: u8, advance: Option<i8>, left: Option<i8>) -> Self {
     Self { x, w, advance, left }
   }
   #[inline]
-  fn advance_or_width(&self) -> i8 {
-    self.advance.unwrap_or(self.w as i8)
+  fn advance_or_width(&self) -> i32 {
+    self.advance.map(|v| v as i32).unwrap_or(self.w as i32)
   }
   #[inline]
-  fn left_bearing_or_zero(&self) -> i8 {
-    self.left.unwrap_or(0)
+  fn left_bearing_or_zero(&self) -> i32 {
+    self.left.map(|v| v as i32).unwrap_or(0)
   }
 }
 
-#[inline]
-fn glyph_to_bytes_with_next(g: &Glyph, next_off: u16) -> [u8; 7] {
-  let mut out = [0u8; 7];
-  out[..2].copy_from_slice(&g.x.to_le_bytes());
-  out[2] = g.w;
-  out[3] = g.advance_or_width() as u8; // i8 two's complement
-  out[4] = g.left_bearing_or_zero() as u8; // i8 two's complement
-  out[5..7].copy_from_slice(&next_off.to_le_bytes());
-  out
-}
+// ──────────────────────────────────────────────────────────────────────────────
+// kerning & charset
+// ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Kerning {
@@ -102,24 +98,13 @@ pub struct Kerning {
   pub right: String,
   pub adj: i8,
 }
-impl Kerning {
-  #[inline]
-  pub fn to_bytes(&self) -> anyhow::Result<[u8; 7]> {
-    let l = one_scalar(&self.left, "kerning.left")?;
-    let r = one_scalar(&self.right, "kerning.right")?;
-    let mut out = [0u8; 7];
-    put_u24(&mut out[0..3], l);
-    put_u24(&mut out[3..6], r);
-    out[6] = self.adj as u8;
-    Ok(out)
-  }
-}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct CharsetRange {
   pub start: String,
   pub end: String,
 }
+
 impl CharsetRange {
   #[inline]
   fn span(&self) -> anyhow::Result<(u32, u32, u16)> {
@@ -131,26 +116,185 @@ impl CharsetRange {
     let len_u32 = e - s + 1;
     Ok((s, e, u16::try_from(len_u32).map_err(|_| anyhow::anyhow!("range len {} > u16::MAX", len_u32))?))
   }
+}
+
+struct KerningTable {
+  bytes: Vec<u8>,
+  count: u32,
+}
+impl KerningTable {
+  /// Always encodes { u16 left_idx, u16 right_idx, i8 adj } (5 bytes).
+  fn from_pairs(kerning: &[Kerning], segs: &CharsetSegments, glyph_count: usize) -> anyhow::Result<Self> {
+    if kerning.is_empty() {
+      return Ok(Self { bytes: Vec::new(), count: 0 });
+    }
+    if glyph_count > u16::MAX as usize {
+      anyhow::bail!("glyph_count {} exceeds u16 addressable range", glyph_count);
+    }
+    let mut bytes = Vec::with_capacity(kerning.len() * 5);
+    for (i, k) in kerning.iter().enumerate() {
+      let lcp = one_scalar(&k.left, &format!("kerning[{i}].left"))?;
+      let rcp = one_scalar(&k.right, &format!("kerning[{i}].right"))?;
+      let li = segs
+        .glyph_index_of(lcp)
+        .ok_or_else(|| anyhow::anyhow!("kerning[{i}] left U+{lcp:04X} not in charset"))?;
+      let ri = segs
+        .glyph_index_of(rcp)
+        .ok_or_else(|| anyhow::anyhow!("kerning[{i}] right U+{rcp:04X} not in charset"))?;
+      bytes.extend_from_slice(&li.to_le_bytes());
+      bytes.extend_from_slice(&ri.to_le_bytes());
+      bytes.push(k.adj as u8);
+    }
+    Ok(Self { bytes, count: kerning.len() as u32 })
+  }
+}
+
+struct CharsetSegments {
+  items: Vec<(u32, u16)>, // (start_cp, len) ; base is implicit
+  count: u16,
+}
+impl CharsetSegments {
+  fn build(charset: &[CharsetRange], glyph_len: usize) -> anyhow::Result<Self> {
+    if charset.is_empty() {
+      anyhow::bail!("charset is required");
+    }
+    let mut items = Vec::with_capacity(charset.len());
+    let mut total_len: u32 = 0;
+    for (i, r) in charset.iter().enumerate() {
+      let (start, _end, len) = r.span().map_err(|e| anyhow::anyhow!("charset[{i}]: {e}"))?;
+      total_len = total_len
+        .checked_add(len as u32)
+        .ok_or_else(|| anyhow::anyhow!("charset length overflow (+{})", len))?;
+      items.push((start, len));
+    }
+    if total_len as usize != glyph_len {
+      anyhow::bail!("charset codepoints {} != glyphs {}", total_len, glyph_len);
+    }
+    let count: u16 = items
+      .len()
+      .try_into()
+      .map_err(|_| anyhow::anyhow!("too many charset segments"))?;
+    Ok(Self { items, count })
+  }
+
   #[inline]
-  fn segment_with_base(&self, base: u16) -> anyhow::Result<((u32, u16, u16), u16)> {
-    let (start, _end, len) = self.span()?;
-    let next = base
-      .checked_add(len)
-      .ok_or_else(|| anyhow::anyhow!("glyph base overflow (+{})", len))?;
-    Ok(((start, len, base), next))
+  fn glyph_index_of(&self, cp: u32) -> Option<u16> {
+    let mut base: u32 = 0;
+    for (start, len) in &self.items {
+      let len_u32 = *len as u32;
+      if cp >= *start && cp < *start + len_u32 {
+        return u16::try_from(base + (cp - *start)).ok();
+      }
+      base += len_u32;
+    }
+    None
+  }
+
+  fn write_to(&self, out: &mut Vec<u8>) {
+    for (start_cp, len) in &self.items {
+      push_u24(out, *start_cp);
+      out.extend_from_slice(&len.to_le_bytes());
+    }
   }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// atlas source (A8 pixels)
+/* Glyph record packing */
 // ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct GlyphMetrics {
+  w: u8,
+  h: u8,
+  yoff: u8,
+  adv_i5: i8,
+  left_i4: i8,
+  off18: u32,
+}
+impl GlyphMetrics {
+  #[inline]
+  fn clamp_i5(v: i32) -> i8 {
+    if v < -16 {
+      -16
+    } else if v > 15 {
+      15
+    } else {
+      v as i8
+    }
+  }
+  #[inline]
+  fn clamp_i4(v: i32) -> i8 {
+    if v < -8 {
+      -8
+    } else if v > 7 {
+      7
+    } else {
+      v as i8
+    }
+  }
+
+  fn try_from_glyph(g: &Glyph, h_u7: u8, yoff_u7: u8, off_bytes: u32) -> anyhow::Result<Self> {
+    if g.w > 127 {
+      anyhow::bail!("width {} exceeds u7", g.w);
+    }
+    if h_u7 > 127 {
+      anyhow::bail!("height {} exceeds u7", h_u7);
+    }
+    if yoff_u7 > 127 {
+      anyhow::bail!("yoff {} exceeds u7", yoff_u7);
+    }
+    if off_bytes > 0x3FFFF {
+      anyhow::bail!("blob off {} exceeds u18", off_bytes);
+    }
+    let adv_delta = g.advance_or_width() - (g.w as i32);
+    Ok(Self {
+      w: g.w,
+      h: h_u7,
+      yoff: yoff_u7,
+      adv_i5: Self::clamp_i5(adv_delta),
+      left_i4: Self::clamp_i4(g.left_bearing_or_zero()),
+      off18: off_bytes,
+    })
+  }
+
+  #[inline]
+  fn to_bytes(self) -> [u8; 6] {
+    debug_assert!(self.w <= 127 && self.h <= 127 && self.yoff <= 127 && self.off18 <= 0x3FFFF);
+    let adv5 = ((self.adv_i5 as i16) & 0x1F) as u64;
+    let left4 = ((self.left_i4 as i16) & 0x0F) as u64;
+    let val: u64 = (self.w as u64)
+      | ((self.h as u64) << 7)
+      | ((self.yoff as u64) << 14)
+      | (adv5 << 21)
+      | (left4 << 26)
+      | (((self.off18 as u64) & 0x3FFFF) << 30);
+    [
+      (val & 0xFF) as u8,
+      ((val >> 8) & 0xFF) as u8,
+      ((val >> 16) & 0xFF) as u8,
+      ((val >> 24) & 0xFF) as u8,
+      ((val >> 32) & 0xFF) as u8,
+      ((val >> 40) & 0xFF) as u8,
+    ]
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// atlas & builder
+// ──────────────────────────────────────────────────────────────────────────────
+
+pub struct AtlasBlob {
+  pub glyph_table: Vec<u8>,
+  pub atlas_blob: Vec<u8>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Atlas {
   pub width: u16,
   pub height: u16,
-  pub pixels: Vec<u8>, // A8 source (linear)
-}
+  pub pixels: Vec<u8>,
+} // A8, row-major
+
 impl Atlas {
   #[inline]
   pub fn new(width: u16, height: u16, pixels: Vec<u8>) -> anyhow::Result<Self> {
@@ -160,288 +304,157 @@ impl Atlas {
     }
     Ok(Self { width, height, pixels })
   }
-}
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Per-glyph RLE over L4 BYTES (2 px/byte)
-// ──────────────────────────────────────────────────────────────────────────────
-
-fn build_pgrle_blob(a: &Atlas, glyphs: &[Glyph]) -> (Vec<u8>, Vec<u16>, u16, u16, u16) {
-  let w_total = a.width as usize;
-  let h_total = a.height as usize;
-
-  // Tight vertical band (shared).
-  let mut y_min = h_total;
-  let mut y_max = 0usize;
-  for row in 0..h_total {
-    let base = row * w_total;
-    if a.pixels[base..base + w_total].iter().any(|&px| px != 0) {
-      y_min = y_min.min(row);
-      y_max = y_max.max(row);
+  fn tight_bounds_for_span(&self, x0: usize, gw: usize) -> anyhow::Result<(u8, u8, usize, usize)> {
+    let w_atlas = self.width as usize;
+    let h_atlas = self.height as usize;
+    if x0 + gw > w_atlas {
+      anyhow::bail!("span out of bounds (x0={}, gw={}, w={})", x0, gw, w_atlas);
     }
+
+    let mut y_min = h_atlas;
+    let mut y_max = 0usize;
+    for y in 0..h_atlas {
+      let row = &self.pixels[y * w_atlas + x0..y * w_atlas + x0 + gw];
+      if row.iter().any(|&px| px != 0) {
+        if y < y_min {
+          y_min = y;
+        }
+        if y > y_max {
+          y_max = y;
+        }
+      }
+    }
+    if y_min > y_max {
+      return Ok((0, 0, 0, 0));
+    } // empty
+
+    let h = (y_max - y_min + 1) as i32;
+    if h > 127 {
+      anyhow::bail!("tight height {} exceeds u7", h);
+    }
+    let yoff = y_min as i32;
+    if yoff > 127 {
+      anyhow::bail!("y_off {} exceeds u7", yoff);
+    }
+    Ok((h as u8, yoff as u8, y_min, y_max))
   }
-  let (y_off, h_tight) = if y_min <= y_max {
-    (y_min as u16, (y_max - y_min + 1) as u16)
-  } else {
-    (0u16, 0u16)
-  };
 
-  // Header (6 bytes), then glyph streams.
-  let mut out = Vec::with_capacity(6);
-  out.extend_from_slice(&a.width.to_le_bytes());
-  out.extend_from_slice(&h_tight.to_le_bytes());
-  out.extend_from_slice(&y_off.to_le_bytes());
-
-  let mut next_offs: Vec<u16> = Vec::with_capacity(glyphs.len());
-
-  if h_tight == 0 {
-    return (out, next_offs, a.width, h_tight, y_off);
-  }
-
-  let y_start = y_off as usize;
-  let y_end_excl = y_start + h_tight as usize;
-
-  for g in glyphs {
-    let gx = g.x as usize;
-    let gw = g.w as usize;
-    let bytes_per_row = (gw + 1) / 2;
-
-    // 1) Pack this glyph's band into L4 BYTES (2 px/byte), row-major.
-    let mut l4_bytes: Vec<u8> = Vec::with_capacity(bytes_per_row * (h_tight as usize));
-    for row in y_start..y_end_excl {
-      let base = row * w_total;
+  fn encode_rows_l4_into(&self, x0: usize, gw: usize, y_min: usize, y_max: usize, blob: &mut Vec<u8>) {
+    #[inline]
+    fn quant_l4_round(v: u8) -> u8 {
+      let idx = ((v as u16 + 8) / 16) as u16;
+      if idx > 15 { 15 } else { idx as u8 }
+    }
+    let w_atlas = self.width as usize;
+    let bytes_per_row = (gw + 1) / L4_PIXELS_PER_BYTE;
+    blob.reserve((y_max.saturating_sub(y_min) + 1) * bytes_per_row);
+    for y in y_min..=y_max {
+      let base = y * w_atlas + x0;
       let mut x = 0usize;
       while x < gw {
-        let l = {
-          let src_x = gx + x;
-          if src_x < w_total {
-            quant_l4_round(a.pixels[base + src_x])
-          } else {
-            0
-          }
-        } & 0x0F;
-        let r = if x + 1 < gw {
-          let src_x = gx + x + 1;
-          if src_x < w_total {
-            quant_l4_round(a.pixels[base + src_x])
-          } else {
-            0
-          }
+        let il = quant_l4_round(self.pixels[base + x]) & 0x0F;
+        let ir = if x + 1 < gw {
+          quant_l4_round(self.pixels[base + x + 1]) & 0x0F
         } else {
           0
-        } & 0x0F;
-        l4_bytes.push((r << 4) | l);
+        };
+        blob.push((ir << 4) | il);
         x += 2;
       }
     }
-
-    // 2) RLE-encode BYTES.
-    let rle = rle_encode_bytes(&l4_bytes);
-
-    // 3) Append; record size as u16.
-    let sz = rle.len();
-    if sz > u16::MAX as usize {
-      panic!("glyph RLE exceeds u16: {} bytes at x={}, w={}", sz, g.x, g.w);
-    }
-    next_offs.push(sz as u16);
-    out.extend_from_slice(&rle);
   }
 
-  (out, next_offs, a.width, h_tight, y_off)
-}
-
-/// RLE over BYTES.
-/// - Runs for >=3 bytes (up to 128): emit 0x80..0xFF then 1 value byte.
-/// - Otherwise emit literals of up to 128 bytes: 0x00..0x7F then `len` raw bytes.
-fn rle_encode_bytes(src: &[u8]) -> Vec<u8> {
-  let mut out = Vec::with_capacity(src.len());
-  let mut i = 0usize;
-  while i < src.len() {
-    // Try a run
-    let v = src[i];
-    let mut run = 1usize;
-    while i + run < src.len() && src[i + run] == v && run < 128 {
-      run += 1;
-    }
-    if run >= 3 {
-      out.push(0x80 | ((run as u8) - 1));
-      out.push(v);
-      i += run;
-      continue;
-    }
-
-    // Literal: gather up to 128 bytes or until a run>=3 would start.
-    let lit_start = i;
-    let mut lit_len = 1usize;
-    i += 1;
-    while i < src.len() {
-      // Look-ahead for next run
-      let vv = src[i];
-      let mut r = 1usize;
-      while i + r < src.len() && src[i + r] == vv && r < 128 {
-        r += 1;
-      }
-      if r >= 3 || lit_len >= 128 {
-        break;
-      }
-      lit_len += 1;
-      i += 1;
-    }
-    out.push((lit_len as u8) - 1);
-    out.extend_from_slice(&src[lit_start..lit_start + lit_len]);
-  }
-  out
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// binary tables
-// ──────────────────────────────────────────────────────────────────────────────
-
-struct GlyphTable {
-  bytes: Vec<u8>,
-  count: u16,
-}
-impl GlyphTable {
-  fn from_slice_with_next(glyphs: &[Glyph], next_offs: &[u16]) -> anyhow::Result<Self> {
-    if glyphs.is_empty() {
+  pub fn build(&self, meta: &Metadata) -> anyhow::Result<AtlasBlob> {
+    if meta.glyphs.is_empty() {
       anyhow::bail!("glyphs are required");
     }
-    if glyphs.len() != next_offs.len() {
-      anyhow::bail!("next_offs len {} != glyphs {}", next_offs.len(), glyphs.len());
-    }
-    let count: u16 = glyphs
-      .len()
-      .try_into()
-      .map_err(|_| anyhow::anyhow!("too many glyphs"))?;
-    let mut bytes = Vec::with_capacity(glyphs.len() * 7);
-    for (g, off) in glyphs.iter().zip(next_offs.iter().copied()) {
-      bytes.extend_from_slice(&glyph_to_bytes_with_next(g, off));
-    }
-    Ok(Self { bytes, count })
-  }
-}
+    let mut glyph_table = Vec::with_capacity(meta.glyphs.len() * 6);
+    let mut atlas_blob = Vec::<u8>::new();
 
-struct KerningTable {
-  bytes: Vec<u8>,
-  count: u32,
-}
-impl KerningTable {
-  fn from_slice(kerning: &[Kerning]) -> anyhow::Result<Self> {
-    if kerning.is_empty() {
-      return Ok(Self { bytes: Vec::new(), count: 0 });
+    for (i, g) in meta.glyphs.iter().enumerate() {
+      let x0 = g.x as usize;
+      let gw = g.w as usize;
+      let (h_u7, yoff_u7, y_min, y_max) = self.tight_bounds_for_span(x0, gw)?;
+      let off_bytes = atlas_blob.len() as u32;
+      if off_bytes > 0x3FFFF {
+        anyhow::bail!("glyph[{i}] blob off {} exceeds u18", off_bytes);
+      }
+      let rec = GlyphMetrics::try_from_glyph(g, h_u7, yoff_u7, off_bytes)?;
+      glyph_table.extend_from_slice(&rec.to_bytes());
+      if h_u7 > 0 {
+        self.encode_rows_l4_into(x0, gw, y_min, y_max, &mut atlas_blob);
+      }
     }
-    let packed: anyhow::Result<Vec<[u8; 7]>> = kerning.iter().map(Kerning::to_bytes).collect();
-    let vec = packed?;
-    Ok(Self { bytes: vec.into_iter().flatten().collect(), count: kerning.len() as u32 })
-  }
-}
-
-struct CharsetSegments {
-  items: Vec<(u32, u16, u16)>,
-  count: u16,
-}
-impl CharsetSegments {
-  fn build(charset: &[CharsetRange], glyph_len: usize) -> anyhow::Result<Self> {
-    if charset.is_empty() {
-      anyhow::bail!("charset is required");
-    }
-    let mut items = Vec::with_capacity(charset.len());
-    let mut base: u16 = 0;
-    for (i, r) in charset.iter().enumerate() {
-      let (seg, next) = r
-        .segment_with_base(base)
-        .map_err(|e| anyhow::anyhow!("charset[{i}]: {e}"))?;
-      items.push(seg);
-      base = next;
-    }
-    if base as usize != glyph_len {
-      anyhow::bail!("charset codepoints {} != glyphs {}", base, glyph_len);
-    }
-    let count: u16 = items
-      .len()
-      .try_into()
-      .map_err(|_| anyhow::anyhow!("too many charset segments"))?;
-    Ok(Self { items, count })
-  }
-  fn write_to(&self, out: &mut Vec<u8>) {
-    for (start_cp, len, base) in &self.items {
-      push_u24(out, *start_cp);
-      out.extend_from_slice(&len.to_le_bytes());
-      out.extend_from_slice(&base.to_le_bytes());
-    }
+    Ok(AtlasBlob { glyph_table, atlas_blob })
   }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// assemble (public façade)
+// assemble (compact header writer) — fixed strides, version=0, flags=0
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub fn assemble(meta: Metadata, atlas: Atlas) -> anyhow::Result<Vec<u8>> {
-  if meta.line_height == 0 {
-    anyhow::bail!("line_height must be non-zero");
-  }
+  let (lh_u8, asc_i8, desc_i8) = (meta.line_height_u8()?, meta.ascent_i8()?, meta.descent_i8()?);
 
-  // Build per-glyph RLE blob + per-glyph sizes.
-  let (atlas_blob, next_offs, _w_total, _h_tight, _y_off) = build_pgrle_blob(&atlas, &meta.glyphs);
+  let AtlasBlob { glyph_table, atlas_blob } = atlas.build(&meta)?;
+  let glyph_count_u16: u16 = meta
+    .glyphs
+    .len()
+    .try_into()
+    .map_err(|_| anyhow::anyhow!("too many glyphs"))?;
 
-  let glyphs = GlyphTable::from_slice_with_next(&meta.glyphs, &next_offs)?;
-  let kern = KerningTable::from_slice(&meta.kerning)?;
   let segs = CharsetSegments::build(&meta.charset, meta.glyphs.len())?;
+  let kern = KerningTable::from_pairs(&meta.kerning, &segs, meta.glyphs.len())?;
 
-  // layout
-  let segments_len = segs.items.len() * 7;
-  let header_len = HDR_PREFIX_LEN + segments_len;
+  let seg_cnt_u8: u8 = segs
+    .count
+    .try_into()
+    .map_err(|_| anyhow::anyhow!("segment_count > 255"))?;
+  let ker_cnt_u16: u16 = kern
+    .count
+    .try_into()
+    .map_err(|_| anyhow::anyhow!("kerning_count > 65535"))?;
 
-  let glyphs_off = header_len as u32;
-  let glyphs_len = glyphs.bytes.len() as u32;
+  // prefix = 10 bytes: magic(4) + ver(1) + flags(1=0) + lh(1) + asc(1) + desc(1) + seg_cnt(1)
+  let header_prefix_len = 10usize;
+  let segments_len = (segs.count as usize) * 5; // 5 bytes/segment
+  let glyph_count_field_len = 2usize;
+  let kerning_prefix_len = if kern.count > 0 { 2 } else { 0 }; // u16 kerning_count if present
 
-  let atlas_off = (header_len + glyphs.bytes.len()) as u32;
-  let atlas_len = atlas_blob.len() as u32;
+  let mut out = Vec::with_capacity(
+    header_prefix_len
+      + segments_len
+      + glyph_count_field_len
+      + glyph_table.len()
+      + atlas_blob.len()
+      + kerning_prefix_len
+      + kern.bytes.len(),
+  );
 
-  let mut out = Vec::with_capacity(header_len + glyphs.bytes.len() + atlas_blob.len() + kern.bytes.len());
-
-  // header
   out.extend_from_slice(MAGIC);
   out.push(VERSION);
-  out.push(MFNT_FLAG_ATLAS_PGRLE);
-  out.extend_from_slice(&meta.line_height.to_le_bytes());
-  out.extend_from_slice(&meta.ascent.to_le_bytes());
-  out.extend_from_slice(&meta.descent.to_le_bytes());
-  out.extend_from_slice(&glyphs.count.to_le_bytes());
-  out.extend_from_slice(&glyphs_off.to_le_bytes());
-  out.extend_from_slice(&glyphs_len.to_le_bytes());
-  out.extend_from_slice(&atlas_off.to_le_bytes());
-  out.extend_from_slice(&atlas_len.to_le_bytes());
+  out.push(0); // flags (reserved)
+  out.push(lh_u8);
+  out.push(asc_i8 as u8);
+  out.push(desc_i8 as u8);
 
-  // backpatch slots
-  let off_total_len = out.len();
-  out.extend_from_slice(&0u32.to_le_bytes());
-  let off_kern_off = out.len();
-  out.extend_from_slice(&0u32.to_le_bytes());
-  let off_kern_cnt = out.len();
-  out.extend_from_slice(&0u32.to_le_bytes());
-
-  out.extend_from_slice(&segs.count.to_le_bytes());
+  // -- segment_count and segments
+  out.push(seg_cnt_u8);
   segs.write_to(&mut out);
 
-  // tables
-  out.extend_from_slice(&glyphs.bytes);
+  // -- glyph_count then glyph table
+  out.extend_from_slice(&glyph_count_u16.to_le_bytes());
+  out.extend_from_slice(&glyph_table);
+
+  // -- atlas blob
   out.extend_from_slice(&atlas_blob);
 
-  // kerning tail
-  let (kern_off, kern_cnt) = if kern.bytes.is_empty() {
-    (0, 0)
-  } else {
-    let off = out.len() as u32;
+  // -- optional kerning tail (5B/pair)
+  if kern.count > 0 {
+    out.extend_from_slice(&ker_cnt_u16.to_le_bytes());
     out.extend_from_slice(&kern.bytes);
-    (off, kern.count)
-  };
-
-  // backpatch
-  let total_len = out.len() as u32;
-  out[off_total_len..off_total_len + 4].copy_from_slice(&total_len.to_le_bytes());
-  out[off_kern_off..off_kern_off + 4].copy_from_slice(&kern_off.to_le_bytes());
-  out[off_kern_cnt..off_kern_cnt + 4].copy_from_slice(&kern_cnt.to_le_bytes());
+  }
 
   Ok(out)
 }
@@ -458,12 +471,6 @@ fn one_scalar(s: &str, label: &str) -> anyhow::Result<u32> {
     anyhow::bail!("{label} must be one scalar");
   }
   Ok(c as u32)
-}
-#[inline]
-fn put_u24(dst: &mut [u8], v: u32) {
-  dst[0] = (v & 0xFF) as u8;
-  dst[1] = ((v >> 8) & 0xFF) as u8;
-  dst[2] = ((v >> 16) & 0xFF) as u8;
 }
 #[inline]
 fn push_u24(buf: &mut Vec<u8>, v: u32) {

@@ -1,7 +1,9 @@
 [package]
-  keywords = ["embedded"]
-  name     = "minitype"
+  categories = ["embedded", "graphics", "no-std"]
+  keywords   = ["embedded", "font", "bitmap", "no-std"]
+  name       = "minitype"
 
+  description             = "A tiny, efficient bitmap font format for embedded_graphics"
   documentation.workspace = true
   edition.workspace       = true
   homepage.workspace      = true

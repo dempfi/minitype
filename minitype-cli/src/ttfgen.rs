@@ -1,13 +1,13 @@
-use crate::font::{Atlas, CharsetRange, Glyph, Metadata, assemble};
+use crate::font::{Atlas, CharsetRange, Glyph, Metadata};
 use anyhow::{Result, anyhow};
 use rayon::ThreadPoolBuilder;
 use std::{collections::HashMap, sync::Arc};
 use ttf_parser::Face;
-use webrender_api::{
+use zng_webrender_api::{
   ColorF, FontInstanceFlags, FontInstanceKey, FontInstanceOptions, FontInstancePlatformOptions, FontKey,
   FontRenderMode, FontTemplate, GlyphIndex, IdNamespace, units::DevicePoint,
 };
-use wr_glyph_rasterizer::{
+use zng_wr_glyph_rasterizer::{
   BaseFontInstance, FontInstance, GlyphKey, GlyphRasterizer, RasterizedGlyph, SharedFontResources, SubpixelDirection,
   profiler::GlyphRasterizeProfiler,
 };
@@ -21,12 +21,8 @@ struct Row {
   bytes: Vec<u8>, // L8 tightly packed (w * h)
 }
 
-/// Build MiniType (MFNT) + artifacts (PNG L8 preview + JSON meta).
-pub fn build_from_ttf_with_artifacts(
-  ttf: &[u8],
-  px: f32,
-  ranges: &[(char, char)],
-) -> Result<(Vec<u8>, Vec<u8>, String)> {
+///  MiniType
+pub fn convert_from_ttf(ttf: &[u8], px: f32, ranges: &[(char, char)]) -> Result<(Metadata, Atlas)> {
   if px <= 0.0 {
     return Err(anyhow!("px must be > 0"));
   }
@@ -59,15 +55,7 @@ pub fn build_from_ttf_with_artifacts(
   let atlas_h: u16 = (ascent_px + descent_px).ceil().max(1.0) as u16;
 
   // 3) Rasterize (L8)
-  let rasters = rasterize_glyphs_wr(
-    ttf,
-    px,
-    &charset,
-    FontRenderMode::Alpha,
-    FontInstanceFlags::SUBPIXEL_POSITION,
-    SubpixelDirection::None,
-    DevicePoint::new(0.0, 0.0),
-  )?;
+  let rasters = rasterize_glyphs(ttf, px, &charset)?;
   if rasters.len() != charset.len() {
     return Err(anyhow!("rasterizer returned {} glyphs for {} chars", rasters.len(), charset.len()));
   }
@@ -155,8 +143,9 @@ pub fn build_from_ttf_with_artifacts(
     }
   }
 
-  // 6) JSON meta
-  let charset_json: Vec<CharsetRange> = ranges
+  let atlas = Atlas::new(atlas_w, atlas_h, l8)?;
+
+  let charsets: Vec<CharsetRange> = ranges
     .iter()
     .map(|(s, e)| CharsetRange { start: s.to_string(), end: e.to_string() })
     .collect();
@@ -167,17 +156,10 @@ pub fn build_from_ttf_with_artifacts(
     descent: descent_px.round() as i16,
     glyphs: glyphs_out,
     kerning: Vec::new(),
-    charset: charset_json,
+    charset: charsets,
   };
-  let json_text = serde_json::to_string_pretty(&meta)?;
 
-  // 7) PNG preview (L8)
-  let png = encode_l8_png(&l8, atlas_w, atlas_h)?;
-
-  // 8) Assemble
-  let atlas = Atlas::new(atlas_w, atlas_h, l8)?;
-  let font = assemble(meta, atlas)?;
-  Ok((font, png, json_text))
+  Ok((meta, atlas))
 }
 
 fn expand_charset(ranges: &[(char, char)]) -> Result<Vec<char>> {
@@ -198,36 +180,8 @@ fn expand_charset(ranges: &[(char, char)]) -> Result<Vec<char>> {
   Ok(out)
 }
 
-// Encode an L8 grayscale image to PNG bytes.
-fn encode_l8_png(pixels: &[u8], w: u16, h: u16) -> Result<Vec<u8>> {
-  use image::{ExtendedColorType, ImageEncoder as _, codecs::png::PngEncoder};
-  let mut out = Vec::new();
-  PngEncoder::new(&mut out).write_image(pixels, w as u32, h as u32, ExtendedColorType::L8)?;
-  Ok(out)
-}
-
-#[inline]
-pub(super) fn saturate_i8(v: f32) -> i8 {
-  let r = v.round();
-  if r < i8::MIN as f32 {
-    i8::MIN
-  } else if r > i8::MAX as f32 {
-    i8::MAX
-  } else {
-    r as i8
-  }
-}
-
 /// Rasterize the requested characters from raw font bytes using wr_glyph_rasterizer.
-pub fn rasterize_glyphs_wr(
-  font_bytes: &[u8],
-  px: f32,
-  chars: &[char],
-  render_mode: FontRenderMode,
-  flags: FontInstanceFlags,
-  subpixel_dir: SubpixelDirection,
-  device_pos: DevicePoint,
-) -> Result<Vec<RasterizedGlyph>> {
+fn rasterize_glyphs(font_bytes: &[u8], px: f32, chars: &[char]) -> Result<Vec<RasterizedGlyph>> {
   if px <= 0.0 {
     return Err(anyhow!("px must be > 0"));
   }
@@ -277,21 +231,18 @@ pub fn rasterize_glyphs_wr(
       .ok_or_else(|| anyhow!("Missing FontTemplate"))?,
   );
 
-  let font = fonts
-    .instances
-    .get_font_instance(font_instance_key)
-    .ok_or_else(|| anyhow!("Missing BaseFontInstance"))?;
-  let mut instance = FontInstance::new(font, ColorF::BLACK.into(), render_mode, flags);
+  let font = fonts.instances.get_font_instance(font_instance_key).unwrap();
+  let mut instance = FontInstance::new(font, ColorF::BLACK.into(), FontRenderMode::Alpha, FontInstanceFlags::empty());
   ras.prepare_font(&mut instance);
 
   // Map chars → glyph indices → keys (preserve order)
-  let mut keys = Vec::with_capacity(chars.len());
-  for &ch in chars {
-    let gidx: GlyphIndex = ras
-      .get_glyph_index(shared_font_key, ch)
-      .ok_or_else(|| anyhow!("No glyph for U+{:04X}", ch as u32))?;
-    keys.push(GlyphKey::new(gidx, device_pos, subpixel_dir));
-  }
+  let keys: Vec<GlyphKey> = chars
+    .into_iter()
+    .map(|&ch| {
+      let gidx: GlyphIndex = ras.get_glyph_index(shared_font_key, ch).unwrap();
+      GlyphKey::new(gidx, DevicePoint::zero(), SubpixelDirection::None)
+    })
+    .collect();
 
   // Queue + resolve
   ras.request_glyphs(instance, &keys, |_| true);
@@ -304,11 +255,7 @@ pub fn rasterize_glyphs_wr(
     &mut Profiler,
   );
 
-  let mut out = Vec::with_capacity(keys.len());
-  for key in keys {
-    out.push(map.remove(&key).expect("missing raster for key"));
-  }
-  Ok(out)
+  Ok(keys.into_iter().map(|k| map.remove(&k).unwrap()).collect())
 }
 
 struct Profiler;
@@ -386,4 +333,16 @@ fn crop_l8_tight(bytes: &[u8], w: i32, h: i32) -> Option<(Vec<u8>, i32, i32, i32
 #[inline]
 fn push_empty_glyph(out: &mut Vec<Glyph>, x: u16, adv_i8: i8) {
   out.push(Glyph::new(x, 0, Some(adv_i8), Some(0)));
+}
+
+#[inline]
+fn saturate_i8(v: f32) -> i8 {
+  let r = v.round();
+  if r < i8::MIN as f32 {
+    i8::MIN
+  } else if r > i8::MAX as f32 {
+    i8::MAX
+  } else {
+    r as i8
+  }
 }

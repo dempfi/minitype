@@ -920,8 +920,8 @@ dependencies = [
  "serde",
  "serde_json",
  "ttf-parser",
- "webrender_api",
- "wr_glyph_rasterizer",
+ "zng-webrender-api",
+ "zng-wr-glyph-rasterizer",
 ]
 
 [[package]]
@@ -1032,27 +1032,6 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
-
-[[package]]
-name = "peek-poke"
-version = "0.3.0"
-source = "git+https://github.com/servo/webrender.git#c4bd5b47d8f5cd684334b445e67a1f945d106848"
-dependencies = [
- "euclid",
- "peek-poke-derive",
-]
-
-[[package]]
-name = "peek-poke-derive"
-version = "0.3.0"
-source = "git+https://github.com/servo/webrender.git#c4bd5b47d8f5cd684334b445e67a1f945d106848"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.106",
- "synstructure",
- "unicode-xid",
-]
 
 [[package]]
 name = "pest"
@@ -1480,17 +1459,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "time"
-version = "0.1.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b797afad3f312d1c66a56d11d0316f916356d11bd158fbc6ca6389ff6bf805a"
-dependencies = [
- "libc",
- "wasi 0.10.0+wasi-snapshot-preview1",
- "winapi",
-]
-
-[[package]]
 name = "toml"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1555,12 +1523,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a5f39404a5da50712a4c1eecf25e90dd62b613502b7e925fd4e4d19b5c96512"
 
 [[package]]
-name = "unicode-xid"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
-
-[[package]]
 name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1588,12 +1550,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "wasi"
-version = "0.10.0+wasi-snapshot-preview1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a143597ca7c7793eff794def352d41792a93c481eb1042423ff7ff72ba2c31f"
 
 [[package]]
 name = "wasi"
@@ -1666,25 +1622,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a05d73b933a847d6cccdda8f838a22ff101ad9bf93e33684f39c1f5f0eece3d"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "webrender_api"
-version = "0.62.0"
-source = "git+https://github.com/servo/webrender.git#c4bd5b47d8f5cd684334b445e67a1f945d106848"
-dependencies = [
- "app_units",
- "bitflags 2.9.2",
- "byteorder",
- "crossbeam-channel",
- "euclid",
- "malloc_size_of_derive",
- "peek-poke",
- "serde",
- "serde_bytes",
- "serde_derive",
- "time",
- "wr_malloc_size_of",
 ]
 
 [[package]]
@@ -1823,39 +1760,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wr_glyph_rasterizer"
-version = "0.1.0"
-source = "git+https://github.com/servo/webrender.git#c4bd5b47d8f5cd684334b445e67a1f945d106848"
-dependencies = [
- "core-foundation",
- "core-graphics",
- "core-text",
- "dwrote",
- "euclid",
- "freetype",
- "fxhash",
- "lazy_static",
- "libc",
- "log",
- "malloc_size_of_derive",
- "objc",
- "rayon",
- "smallvec",
- "tracy-rs",
- "webrender_api",
- "wr_malloc_size_of",
-]
-
-[[package]]
-name = "wr_malloc_size_of"
-version = "0.0.2"
-source = "git+https://github.com/servo/webrender.git#c4bd5b47d8f5cd684334b445e67a1f945d106848"
-dependencies = [
- "app_units",
- "euclid",
-]
-
-[[package]]
 name = "zerocopy"
 version = "0.8.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1873,6 +1777,82 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.106",
+]
+
+[[package]]
+name = "zng-peek-poke"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a2d875c7e83e5fc09526f6ca993f9dd027db26eccd31dae7948cbd42d558f65"
+dependencies = [
+ "euclid",
+ "zng-peek-poke-derive",
+]
+
+[[package]]
+name = "zng-peek-poke-derive"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0798be62f12d2cbc27182b0f2979bffe49305ae77631d4bbec36c98a6314319"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+ "synstructure",
+]
+
+[[package]]
+name = "zng-webrender-api"
+version = "0.65.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e03ec6b3165a70ab23006408e082e50868d374f2d75cb5a5dcdc10ae295043b"
+dependencies = [
+ "app_units",
+ "bitflags 2.9.2",
+ "byteorder",
+ "crossbeam-channel",
+ "euclid",
+ "malloc_size_of_derive",
+ "serde",
+ "serde_bytes",
+ "serde_derive",
+ "zng-peek-poke",
+ "zng-wr-malloc-size-of",
+]
+
+[[package]]
+name = "zng-wr-glyph-rasterizer"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcba65e211a33273303b96a03108cb1c3fa6e51274a328419a5684b7cb5dd023"
+dependencies = [
+ "core-foundation",
+ "core-graphics",
+ "core-text",
+ "dwrote",
+ "euclid",
+ "freetype",
+ "fxhash",
+ "lazy_static",
+ "libc",
+ "log",
+ "malloc_size_of_derive",
+ "objc",
+ "rayon",
+ "smallvec",
+ "tracy-rs",
+ "zng-webrender-api",
+ "zng-wr-malloc-size-of",
+]
+
+[[package]]
+name = "zng-wr-malloc-size-of"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225bd609d645c04a4b1d338f963c8b4d12921591da4984d86c73e5dac82e083c"
+dependencies = [
+ "app_units",
+ "euclid",
 ]
 
 [[package]]

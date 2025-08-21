@@ -1,11 +1,9 @@
-# MiniType Font Specification
+# [UNSTABLE] MiniType Font Specification
 
 Compact, MCU-friendly bitmap font container with tight atlas packing and per-glyph quantization hints.
 
 - **Use case:** embedded targets rendering antialiased glyphs from a pre-baked horizontal atlas strip.
 - **Goals:** tiny, deterministic decoder; fixed endianness; minimal metadata; streaming-friendly O(1) seeks.
-
----
 
 ## 1. Conventions
 
@@ -14,127 +12,110 @@ Compact, MCU-friendly bitmap font container with tight atlas packing and per-gly
 - **Integer types:** `u8`, `u16`, `u24` (3 bytes LE), `i16`, `u32`.
 - **L4 packing:** 2 pixels per byte — **low nibble = left pixel**, **high nibble = right pixel**.
 
----
-
 ## 2. File layout (high-level)
 
 ```
-+––––––––––----------+
-| Header             | 0x2C fixed + 7×charset_seg_count
-+–––––----------–––––+
-| Charset Segments   | inside header region (7 bytes each)
-+––––––––----------––+
-| Glyph Table        | glyph_count × 6 bytes
-+–––----------–––––––+
-| Atlas (inner)      | see §7
-+–––––––––----------–+
-| Kerning (optional) | kerning_count × 7 bytes
-+––––––––––----------+
++---------------------+
+| Header              | 14 bytes + 7 × segment_count
++---------------------+
+| Charset Segments    | inside header region (7 bytes each)
++---------------------+
+| Glyph Table         | glyph_count × 6 bytes (bit-packed)
++---------------------+
+| Atlas Blob          | concatenation of per-glyph tight rows
++---------------------+
+| Kerning (optional)  | kerning_count × 7 bytes
++---------------------+
 ```
 
-No padding. Offsets recorded in the header.
-
----
+The kerning block is present only if there are bytes remaining after the atlas blob: `u16 kerning_count, then kerning_count × 5-byte pairs`
 
 ## 3. Header (fixed + variable)
 
-Fixed 44 bytes, then `segment_count` charset records.
+Fixed 14 bytes, then `segment_count` charset records.
 
-| Off  | Size | Type | Field         | Description                   |
-| :--: | :--: | :--: | ------------- | ----------------------------- |
-| 0x00 |  4   |      | MAGIC         | ASCII `"MFNT"`                |
-| 0x04 |  1   |  u8  | VERSION       | **1**                         |
-| 0x05 |  1   |  u8  | FLAGS         | Reserved = 0                  |
-| 0x06 |  2   | u16  | line_height   | Baseline-to-baseline          |
-| 0x08 |  2   | i16  | ascent        | Pixels above baseline         |
-| 0x0A |  2   | i16  | descent       | Pixels below baseline         |
-| 0x0C |  2   | u16  | glyph_count   | Number of glyphs              |
-| 0x0E |  4   | u32  | glyphs_off    | Offset to glyph table         |
-| 0x12 |  4   | u32  | glyphs_len    | **6 × glyph_count**           |
-| 0x16 |  4   | u32  | atlas_off     | Offset to inner atlas         |
-| 0x1A |  4   | u32  | atlas_len     | Length of inner atlas payload |
-| 0x1E |  4   | u32  | total_len     | Entire file length            |
-| 0x22 |  4   | u32  | kerning_off   | Kerning block offset or 0     |
-| 0x26 |  4   | u32  | kerning_cnt   | Number of kerning pairs       |
-| 0x2A |  2   | u16  | segment_count | Charset segment count         |
-| 0x2C | 7×N  |      | charset_segs  | N = segment_count (see §4)    |
+| Off  | Size | Type | Field         | Description           |
+| :--: | :--: | :--: | ------------- | --------------------- |
+| 0x00 |  4   |      | MAGIC         | ASCII `"MFNT"`        |
+| 0x04 |  1   |  u8  | VERSION       | **0**                 |
+| 0x05 |  1   |  u8  | FLAGS         | Reserved = 0          |
+| 0x06 |  1   |  u8  | line_height   | Baseline-to-baseline  |
+| 0x07 |  1   |  i8  | ascent        | Pixels above baseline |
+| 0x08 |  1   |  i8  | descent       | Pixels below baseline |
+| 0x09 |  1   |  u8  | segment_count | Charset segment count |
 
----
+Immediately following the prefix:
 
-## 4. Charset segments (7 bytes each)
+1. Segments: segment_count × 5 bytes (see §4)
+2. Glyph count: u16 glyph_count
+3. Glyph table: glyph_count × 6 bytes (see §5)
+4. Atlas blob: variable length (see §6)
+5. Kerning tail (optional): u16 kerning_count then kerning_count × 5 bytes (see §7)
 
-| Bytes | Type | Field    | Meaning                   |
-| :---: | :--: | -------- | ------------------------- |
-| 0..3  | u24  | start_cp | First codepoint           |
-| 3..5  | u16  | len      | Number of codepoints      |
-| 5..7  | u16  | base     | Glyph index of `start_cp` |
+## 4. Charset segments (5 bytes each)
 
-Maps Unicode ranges → glyph indices.
+| Bytes | Type | Field    | Meaning              |
+| :---: | :--: | -------- | -------------------- |
+| 0..3  | u24  | start_cp | First codepoint      |
+| 3..5  | u16  | len      | Number of codepoints |
 
----
+## 5. Glyph table (6 bytes per glyph)
 
-## 5. Glyph table (5 bytes per glyph)
+|  Bits   | Type | Field           | Description                                     |
+| :-----: | :--: | --------------- | ----------------------------------------------- |
+|  0..=6  |  u7  | w               | Glyph width (px)                                |
+| 7..=13  |  u8  | w               | Glyph width (px)                                |
+| 14..=20 |  u8  | y_off_first_row | Offset from line top to glyph's first tight row |
+| 21..=25 |  i5  | advance_delta   | (advance - w), range -16..+15                   |
+| 26..=29 |  i4  | left_bearing    | Left side bearing                               |
+| 30..=47 | u18  | glyph_blob_off  | Byte offset from start of atlas blob            |
 
-| Bytes | Type | Field   | Description             |
-| :---: | :--: | ------- | ----------------------- |
-| 0..2  | u16  | x       | X offset in atlas strip |
-|   2   |  u8  | w       | Glyph width (px)        |
-|   3   |  i8  | advance | Signed advance          |
-|   4   |  i8  | left    | Left side bearing       |
+Derived:
 
----
+```
+advance = (w as i16) + (advance_delta as i16)
+bytes_per_row = ceil(w / 2)
+glyph_blob_span = bytes_per_row * h (bytes)
+glyph_blob_ptr = file[atlas_off + glyph_blob_off..]
+```
 
-## 6. Kerning block (optional)
+## 6. Atlas blob (per-glyph tight rows)
 
-If `kerning_cnt > 0`:
+The atlas blob is a concatenation of tightly cropped L4 rows for each glyph, in glyph order.
 
-| Bytes | Type | Field | Meaning         |
-| :---: | :--: | ----- | --------------- |
-| 0..3  | u24  | left  | Left codepoint  |
-| 3..6  | u24  | right | Right codepoint |
-|   6   |  i8  | adj   | Advance adjust  |
+For each glyph:
 
----
+- Rows: exactly h rows.
+- Each row has `bytes_per_row = ceil(w/2)` bytes.
+- Order: row 0, row 1, … row h-1, then the next glyph's rows.
 
-## 7. Inner atlas (tight-crop)
+L4 rows: low nibble = left pixel, high nibble = right pixel; odd width → last high nibble is padding and ignored.
 
-### 7.1 Atlas header (70 bytes)
+## 7. Kerning tail (optional; 5 bytes per pair)
 
-| Off | Size | Type | Field   | Notes                     |
-| :-: | :--: | :--: | ------- | ------------------------- |
-|  0  |  2   | u16  | width   | Atlas width (px)          |
-|  2  |  2   | u16  | h_tight | Height of serialized band |
-|  4  |  2   | u16  | y_off   | Offset from original top  |
+If present:
 
-### 7.2 Row payload
-
-- Immediately follows header.
-- `row_stride = ceil(width/2)` bytes.
-- Total = `h_tight × row_stride`.
-- Pixels stored as linear L4 indices: low nibble=left, high=right.
-- Odd width → last high nibble = 0, ignored.
-
----
+| Bytes | Type | Field | Meaning           |
+| :---: | :--: | ----- | ----------------- |
+| 0..2  | u16  | left  | Left glyph index  |
+| 2..4  | u16  | right | Right glyph index |
+|   4   |  i8  | adj   | Advance adjust    |
 
 ## 8. Rendering model
 
-1. Map codepoint → glyph idx (§4).
-2. Get glyph `(x, w, advance, left, q)` (§5).
-3. Rectangle in atlas: `[x..x+w) × [0..h_tight)`.
-4. Iterate row-major:
-   - Row ptr = `payload + ry*row_stride + (x>>1)`
-   - Use `(x&1)` for nibble select.
-   - Expand nibble → alpha `nibble * 16`.
-5. Blit at `(pen_x+left, pen_y-ascent+y_off)`.
-6. Apply kerning if present.
-7. Advance pen_x.
-
----
+1. Compute line_top relative to the baseline using ascent/descent.
+2. Map codepoint → glyph index via segments (§4).
+3. Read glyph record (§5) → `{w, h, yoff, left_bearing, adv_delta, blob_off}`.
+4. `advance = w + adv_delta`.
+5. Seek pixels: `ptr = atlas_off + blob_off`.
+6. For each row 0..h-1, read `bytes_per_row` bytes, expand L4 nibbles to coverage (e.g., `alpha = nibble << 4`), and blit at:
+   - `dst_x = pen_x + left_bearing`
+   - `dst_y = line_top + yoff + row`
+7. Advance pen: `pen_x += advance`, then apply kerning if available.
 
 ## 9. Validation rules
 
-- MAGIC = `"MFNT"`, VERSION=1
-- `glyphs_len == 6×glyph_count`
-- `atlas_len == 70 + h_tight×row_stride`
-- `x+w ≤ width` for all glyphs
-- If kerning: `kerning_off ≥ atlas_off+atlas_len` and fits in file.
+- MAGIC = `"MFNT"`, VERSION=0
+- `file_len ≥ header_len + glyph_table_len + kerning_len`
+- `kerning_off = file_len - 7*kerning_count` and `kerning_off ≥ atlas_off`.
+  • Charset segments must be consistent and cover exactly glyph_count entries when bases are applied.

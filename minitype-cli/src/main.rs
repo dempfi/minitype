@@ -7,8 +7,6 @@ use clap::{ArgAction, Parser};
 use image::GenericImageView;
 use std::{fs, fs::File, io::Write, path::PathBuf};
 
-use crate::font::{Atlas, Metadata, assemble};
-
 // ---------------------------------------------
 // minitype: Font builder CLI
 // Modes:
@@ -100,12 +98,13 @@ fn main() -> Result<()> {
     let size = cli.size.ok_or_else(|| anyhow!("--size is required with --ttf"))?;
     let ranges = parse_ranges(&cli.ranges)?;
     let ttf_bytes = fs::read(ttf_path).with_context(|| format!("read ttf {:?}", ttf_path))?;
-    let (font, png, json_text) =
-      ttfgen::build_from_ttf_with_artifacts(&ttf_bytes, size, &ranges).context("build from TTF")?;
+    let (meta, atlas) = ttfgen::convert_from_ttf(&ttf_bytes, size, &ranges).context("build from TTF")?;
 
     // Optionally write preview artifacts when --preview is set
     if cli.preview {
       // Derive sidecar paths from --output (Foo.mtt -> Foo.atlas.png / Foo.meta.json)
+      let json_text = serde_json::to_string_pretty(&meta)?;
+      let png = encode_l8_png(&atlas.pixels, atlas.width, atlas.height)?;
       let base = cli.output.with_extension("");
       let atlas_path = base.with_extension("atlas.png");
       let meta_path = base.with_extension("meta.json");
@@ -113,7 +112,8 @@ fn main() -> Result<()> {
       fs::write(&atlas_path, &png).with_context(|| format!("write {:?}", atlas_path))?;
       fs::write(&meta_path, &json_text).with_context(|| format!("write {:?}", meta_path))?;
     }
-    font
+
+    font::assemble(meta, atlas)?
   } else {
     let atlas_path = cli
       .atlas
@@ -128,11 +128,11 @@ fn main() -> Result<()> {
     let png_bytes = fs::read(atlas_path).with_context(|| format!("read atlas {:?}", atlas_path))?;
     let json_text = fs::read_to_string(json_path).with_context(|| format!("read json {:?}", json_path))?;
 
-    let meta: Metadata = serde_json::from_str(&json_text)?;
+    let meta: font::Metadata = serde_json::from_str(&json_text)?;
     let (w, h, l8) = decode_png_to_l8(&png_bytes)?;
-    let atlas = Atlas::new(w, h, l8)?;
+    let atlas = font::Atlas::new(w, h, l8)?;
 
-    assemble(meta, atlas)?
+    font::assemble(meta, atlas)?
   };
 
   // Write output
@@ -205,4 +205,12 @@ fn decode_png_to_l8(bytes: &[u8]) -> anyhow::Result<(u16, u16, Vec<u8>)> {
   };
 
   Ok((w16, h16, l8))
+}
+
+// Encode an L8 grayscale image to PNG bytes.
+fn encode_l8_png(pixels: &[u8], w: u16, h: u16) -> Result<Vec<u8>> {
+  use image::{ExtendedColorType, ImageEncoder as _, codecs::png::PngEncoder};
+  let mut out = Vec::new();
+  PngEncoder::new(&mut out).write_image(pixels, w as u32, h as u32, ExtendedColorType::L8)?;
+  Ok(out)
 }
