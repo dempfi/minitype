@@ -1,12 +1,11 @@
 #![no_std]
 
-//! Minimal no_std MiniType font reader & streaming glyph iterator (multi-palette L4).
+//! Minimal no_std MiniType font reader & streaming glyph iterator (linear L4).
 //!
 //! File format (relevant parts):
 //! - Header "MFNT", version=1
-//! - Glyph table: 6 bytes/record → u16 x, u8 w, i8 advance, i8 left, u8 q
+//! - Glyph table: 5 bytes/record → u16 x, u8 w, i8 advance, i8 left
 //! - Atlas blob: u16 w, u16 h_tight, u16 y_off,
-//!               [u8;64] palettes (4×16; each palette[0]==0),
 //!               rows (L4, 2px/byte; h_tight contiguous rows)
 //!
 //! This module is `no_std` (uses only `core`).
@@ -31,8 +30,6 @@ pub enum Error {
   LengthMismatch,
   /// Inner atlas header too short or inconsistent.
   AtlasHeader,
-  /// Any atlas palette[k][0] must be 0x00.
-  Palette0,
   /// Atlas payload shorter than required by height/width.
   AtlasTooShort,
   /// Glyph table record out of bounds.
@@ -43,17 +40,13 @@ pub enum Error {
   KerningBounds,
 }
 
-/// Compact glyph metadata (6 bytes/glyph in the file).
+/// Compact glyph metadata (5 bytes/glyph in the file).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GlyphMeta {
   pub x: u16,
   pub w: u8,
   pub advance: i8,
   pub left: i8,
-  /// Quantization/dequantization hints byte (expanded):
-  pub palette_id: usize,
-  pub scale_idx: usize,
-  pub bias16: u16,
 }
 
 /// Optional kerning pair (7 bytes each in the file).
@@ -89,13 +82,12 @@ pub struct MiniTypeFont<'a> {
   pub kerning_off: usize, // 0 means none
 
   // Atlas inner header (tight-cropped)
-  pub atlas_width: u16,    // w
-  pub atlas_height: u16,   // h_tight
-  pub atlas_y_off: u16,    // y_off from the top of original L8
-  palettes: [[u8; 16]; 4], // 4 palettes
+  pub atlas_width: u16,  // w
+  pub atlas_height: u16, // h_tight
+  pub atlas_y_off: u16,  // y_off from the top of original A8
 
   // Derived geometry
-  pub payload_off: usize,      // == atlas_off + 6 + 64
+  pub payload_off: usize,      // == atlas_off + 6
   pub row_stride_bytes: usize, // == ceil(width/2)
 }
 
@@ -136,15 +128,16 @@ impl<'a> MiniTypeFont<'a> {
     if glyph_table_off != header_len {
       return Err(Error::Malformed);
     }
-    if glyph_table_len != 6usize * (glyph_count as usize) {
+    // 5 bytes per glyph (linear L4, no q)
+    if glyph_table_len != 5usize * (glyph_count as usize) {
       return Err(Error::Malformed);
     }
     if atlas_off != glyph_table_off + glyph_table_len {
       return Err(Error::Malformed);
     }
 
-    // ---- Inner atlas header: need at least 6+64 bytes
-    if atlas_off + 6 + 64 > total_len {
+    // ---- Inner atlas header: need at least 6 bytes
+    if atlas_off + 6 > total_len {
       return Err(Error::AtlasHeader);
     }
 
@@ -152,19 +145,8 @@ impl<'a> MiniTypeFont<'a> {
     let h_tight = le_u16_at(data, atlas_off + 2);
     let y_off = le_u16_at(data, atlas_off + 4);
 
-    // Read 4×16 palettes
-    let mut palettes = [[0u8; 16]; 4];
-    let mut p_off = atlas_off + 6;
-    for k in 0..4 {
-      palettes[k] = read_u8_16(data, p_off);
-      p_off += 16;
-      if palettes[k][0] != 0 {
-        return Err(Error::Palette0);
-      }
-    }
-
     // Derived geometry
-    let payload_off = atlas_off + 6 + 64;
+    let payload_off = atlas_off + 6;
     let row_stride_bytes = ceil_div_u16(width, 2) as usize;
 
     // Tight rows payload must fit in file and in declared atlas_len
@@ -172,7 +154,7 @@ impl<'a> MiniTypeFont<'a> {
       return Err(Error::AtlasTooShort);
     }
     let need_payload = (h_tight as usize) * row_stride_bytes;
-    if atlas_len < 6 + 64 + need_payload {
+    if atlas_len < 6 + need_payload {
       return Err(Error::AtlasTooShort);
     }
     if payload_off + need_payload > total_len {
@@ -197,7 +179,6 @@ impl<'a> MiniTypeFont<'a> {
       atlas_width: width,
       atlas_height: h_tight,
       atlas_y_off: y_off,
-      palettes,
       payload_off,
       row_stride_bytes,
     })
@@ -231,18 +212,8 @@ impl<'a> MiniTypeFont<'a> {
     let h_tight = le_u16_at(data, atlas_off + 2);
     let y_off = le_u16_at(data, atlas_off + 4);
 
-    // 4×16 palettes
-    let mut palettes = [[0u8; 16]; 4];
-    let mut p_off = atlas_off + 6;
-    let mut k = 0;
-    while k < 4 {
-      palettes[k] = read_u8_16(data, p_off);
-      p_off += 16;
-      k += 1;
-    }
-
     // Geometry (no validation)
-    let payload_off = atlas_off + 6 + 64;
+    let payload_off = atlas_off + 6;
     let row_stride_bytes = ceil_div_u16(width, 2) as usize;
 
     Self {
@@ -263,31 +234,26 @@ impl<'a> MiniTypeFont<'a> {
       atlas_width: width,
       atlas_height: h_tight,
       atlas_y_off: y_off,
-      palettes,
       payload_off,
       row_stride_bytes,
     }
   }
 
-  /// Fetch glyph metadata by glyph index (6 bytes/record).
+  /// Fetch glyph metadata by glyph index (5 bytes/record).
   #[inline]
   pub fn glyph_meta(&self, index: u16) -> Option<GlyphMeta> {
     if index as usize >= self.glyph_count as usize {
       return None;
     }
-    let off = self.glyph_table_off + (index as usize) * 6;
-    if off + 6 > self.data.len() {
+    let off = self.glyph_table_off + (index as usize) * 5;
+    if off + 5 > self.data.len() {
       return None;
     }
     let x = le_u16_at(&self.data, off);
     let w = self.data[off + 2];
     let advance = self.data[off + 3] as i8;
     let left = self.data[off + 4] as i8;
-    let q = self.data[off + 5];
-    let palette_id = (q & 0b11) as usize;
-    let scale_idx = ((q >> 2) & 0b11) as usize;
-    let bias16 = ((q >> 4) & 0x0F) as u16;
-    Some(GlyphMeta { x, w, advance, left, palette_id, scale_idx, bias16 })
+    Some(GlyphMeta { x, w, advance, left })
   }
 
   /// Map Unicode scalar value to glyph index using charset segments.
@@ -347,11 +313,6 @@ impl<'a> MiniTypeFont<'a> {
     let idx = self.glyph_index_for_cp(cp)?;
     self.glyph_iter_for_index(idx)
   }
-
-  #[inline]
-  pub fn palettes(&self) -> &[[u8; 16]; 4] {
-    &self.palettes
-  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -381,15 +342,4 @@ pub const fn le_u24_at(b: &[u8], off: usize) -> u32 {
 #[inline]
 pub const fn le_u32_at(b: &[u8], off: usize) -> u32 {
   (b[off] as u32) | ((b[off + 1] as u32) << 8) | ((b[off + 2] as u32) << 16) | ((b[off + 3] as u32) << 24)
-}
-
-#[inline]
-pub const fn read_u8_16(b: &[u8], off: usize) -> [u8; 16] {
-  let mut out = [0u8; 16];
-  let mut i = 0;
-  while i < 16 {
-    out[i] = b[off + i];
-    i += 1;
-  }
-  out
 }
